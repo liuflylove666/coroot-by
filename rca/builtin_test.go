@@ -1,6 +1,7 @@
 package rca
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 
@@ -108,6 +109,97 @@ func TestPropagationMapBuildsBidirectionalEdgesAndNodeIssues(t *testing.T) {
 	}
 	if !hasLink(apps["db-main"].Downstreams, catalog.Id, "") {
 		t.Fatalf("expected db-main downstream back-link to catalog: %+v", apps["db-main"].Downstreams)
+	}
+}
+
+func TestFocusPropagationMapLimitsExternalFanout(t *testing.T) {
+	front := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "front-end"))
+	front.Status = model.CRITICAL
+	openresty := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "openresty"))
+	openresty.Status = model.CRITICAL
+	downstream := &model.AppToAppConnection{Application: openresty, RemoteApplication: front}
+	openresty.Upstreams[front.Id] = downstream
+	front.Downstreams[openresty.Id] = downstream
+
+	var seededExternal model.ApplicationId
+	for i := 0; i < 10; i++ {
+		ext := model.NewApplication(model.NewApplicationId("external", "external", model.ApplicationKindExternalService, fmt.Sprintf("cache-%02d.very-long-service-name.example.com:6379", i)))
+		ext.Status = model.WARNING
+		if i == 0 {
+			seededExternal = ext.Id
+		}
+		conn := &model.AppToAppConnection{
+			Application:           front,
+			RemoteApplication:     ext,
+			Rtt:                   testSeries(0.5),
+			SuccessfulConnections: testSeries(10),
+			ConnectionTime:        testSeries(2),
+		}
+		front.Upstreams[ext.Id] = conn
+		ext.Downstreams[front.Id] = conn
+	}
+
+	pm := propagationMap(front, nil)
+	if len(pm.Applications) <= maxRCAPropagationApplications {
+		t.Fatalf("test setup should create a large propagation map, got %d", len(pm.Applications))
+	}
+	top := &model.RCACandidate{
+		Component:       front.Id.String(),
+		RootCauseReason: "network_connectivity_or_latency",
+		Scenario:        "network_chaos_delay",
+		PyRCAScores:     &model.PyRCAScores{GraphPaths: [][]string{{front.Id.String(), seededExternal.String()}}},
+	}
+	focused := focusPropagationMap(pm, front, top)
+	if got := len(focused.Applications); got > maxRCAPropagationApplications {
+		t.Fatalf("expected focused propagation map to have at most %d applications, got %d", maxRCAPropagationApplications, got)
+	}
+	external := 0
+	apps := map[string]*model.PropagationMapApplication{}
+	for _, a := range focused.Applications {
+		apps[a.Id.String()] = a
+		if a.Id.Kind == model.ApplicationKindExternalService {
+			external++
+		}
+	}
+	if external > maxRCAExternalPropagationApplications {
+		t.Fatalf("expected at most %d external services, got %d", maxRCAExternalPropagationApplications, external)
+	}
+	for _, id := range []model.ApplicationId{front.Id, openresty.Id, seededExternal} {
+		if apps[id.String()] == nil {
+			t.Fatalf("expected focused propagation map to keep %s: %+v", id, focused.Applications)
+		}
+	}
+}
+
+func TestKubernetesEventsFilterUnrelatedEvents(t *testing.T) {
+	app := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "checkout"))
+	candidate := &model.RCACandidate{
+		Id:              "h-001",
+		Component:       app.Id.String(),
+		RootCauseReason: "application_error_logs",
+		Scenario:        "log_error_spike",
+		Score:           0.8,
+		Confidence:      "high",
+		EvidenceRefs:    []string{"check:LogErrors"},
+	}
+	rca := &model.RCA{
+		PropagationMap: &model.PropagationMap{Applications: []*model.PropagationMapApplication{
+			{Id: app.Id, Status: model.CRITICAL, Issues: []string{"Errors"}},
+		}},
+		Widgets: []*model.Widget{},
+	}
+	req := cloud.RCARequest{
+		KubernetesEvents: []*model.LogEntry{
+			{Body: "Back-off restarting failed container fluidity-spot-fox in pod fluidity-spot-fox-55c45ccc64-mv8rs_default"},
+			{Body: "Readiness probe failed for checkout-7dc9bd9d8f-jtr6x"},
+		},
+	}
+	renderSummary(rca, app, []*model.RCACandidate{candidate}, nil, &model.ApplicationIncident{ApplicationId: app.Id, Key: "event", OpenedAt: timeseries.Time(1000), Severity: model.CRITICAL}, req)
+	if strings.Contains(rca.DetailedRootCause, "fluidity-spot-fox") {
+		t.Fatalf("unrelated Kubernetes event should not be rendered as confirmation:\n%s", rca.DetailedRootCause)
+	}
+	if !strings.Contains(rca.DetailedRootCause, "checkout-7dc9bd9d8f-jtr6x") {
+		t.Fatalf("expected related Kubernetes event in details:\n%s", rca.DetailedRootCause)
 	}
 }
 

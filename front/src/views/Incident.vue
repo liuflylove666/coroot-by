@@ -446,9 +446,25 @@ export default {
         this.stopRCAJobPolling();
     },
 
+    watch: {
+        '$route.query.incident'(next, prev) {
+            if (next && next !== prev) {
+                this.get();
+            }
+        },
+        '$route.query.view'() {
+            this.expandRcaDetailsForOverview();
+        },
+    },
+
     methods: {
         get() {
+            if (!this.$route.query.incident) {
+                this.incident = null;
+                return;
+            }
             this.loading = true;
+            this.error = '';
             this.$api.getIncident(this.$route.query.incident, (data, error) => {
                 this.loading = false;
                 if (error) {
@@ -456,7 +472,13 @@ export default {
                     return;
                 }
                 this.incident = data;
+                this.expandRcaDetailsForOverview();
             });
+        },
+        expandRcaDetailsForOverview() {
+            if (this.view === 'overview' && this.incident?.rca?.detailed_root_cause_analysis) {
+                this.show_details = true;
+            }
         },
         toggle_rca_details() {
             this.show_details = !this.show_details;

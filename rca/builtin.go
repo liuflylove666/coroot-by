@@ -12,6 +12,8 @@ import (
 )
 
 const maxRCAWidgets = 40
+const maxRCAPropagationApplications = 8
+const maxRCAExternalPropagationApplications = 4
 const networkRTTAnomalySeconds = 0.01
 const networkConnectionLatencySeconds = 0.10
 
@@ -37,6 +39,7 @@ func BuiltIn(req cloud.RCARequest, world *model.World, incident *model.Applicati
 	}
 	missing := missingEvidence(req, app)
 	pm := propagationMap(app, incident)
+	pm = focusPropagationMap(pm, app, candidates[0])
 	widgets := evidenceWidgets(world, app, pm)
 	addIncidentAnnotation(widgets, req.Ctx.From, req.Ctx.To)
 
@@ -1142,6 +1145,326 @@ func propagationMap(app *model.Application, incident *model.ApplicationIncident)
 	return pm
 }
 
+type propagationEdgeCandidate struct {
+	Src    model.ApplicationId
+	Dst    model.ApplicationId
+	Link   *model.PropagationMapApplicationLink
+	Score  int
+	Seeded bool
+	Order  int
+}
+
+func focusPropagationMap(pm *model.PropagationMap, app *model.Application, top *model.RCACandidate) *model.PropagationMap {
+	if pm == nil || len(pm.Applications) <= maxRCAPropagationApplications {
+		return pm
+	}
+	index := propagationMapIndex(pm)
+	edges := propagationEdges(pm, app, top)
+	if len(edges) == 0 {
+		return pm
+	}
+	sort.SliceStable(edges, func(i, j int) bool {
+		if edges[i].Seeded != edges[j].Seeded {
+			return edges[i].Seeded
+		}
+		if edges[i].Score != edges[j].Score {
+			return edges[i].Score > edges[j].Score
+		}
+		return edges[i].Order < edges[j].Order
+	})
+
+	keepNodes := utils.NewStringSet()
+	keepEdges := map[string]*propagationEdgeCandidate{}
+	externalCount := 0
+	addNode := func(id model.ApplicationId) bool {
+		key := id.String()
+		if keepNodes.Has(key) {
+			return true
+		}
+		if _, ok := index[key]; !ok {
+			return false
+		}
+		if id.Kind == model.ApplicationKindExternalService {
+			if externalCount >= maxRCAExternalPropagationApplications {
+				return false
+			}
+			externalCount++
+		}
+		keepNodes.Add(key)
+		return true
+	}
+	if app != nil {
+		addNode(app.Id)
+	}
+	if id, ok := propagationMapId(index, topComponentId(top)); ok {
+		addNode(id)
+	}
+
+	for i := range edges {
+		e := &edges[i]
+		if !e.Seeded {
+			continue
+		}
+		if addNode(e.Src) && addNode(e.Dst) {
+			keepEdges[propagationEdgeKey(e.Src, e.Dst)] = e
+		}
+	}
+	for i := range edges {
+		e := &edges[i]
+		if len(keepNodes.Items()) >= maxRCAPropagationApplications && (!keepNodes.Has(e.Src.String()) || !keepNodes.Has(e.Dst.String())) {
+			continue
+		}
+		if e.Src.Kind == model.ApplicationKindExternalService && !keepNodes.Has(e.Src.String()) && externalCount >= maxRCAExternalPropagationApplications {
+			continue
+		}
+		if e.Dst.Kind == model.ApplicationKindExternalService && !keepNodes.Has(e.Dst.String()) && externalCount >= maxRCAExternalPropagationApplications {
+			continue
+		}
+		if addNode(e.Src) && addNode(e.Dst) {
+			keepEdges[propagationEdgeKey(e.Src, e.Dst)] = e
+		}
+		if len(keepNodes.Items()) >= maxRCAPropagationApplications {
+			break
+		}
+	}
+	if len(keepEdges) == 0 {
+		return pm
+	}
+	return rebuildPropagationMap(pm, keepNodes, keepEdges)
+}
+
+func propagationMapIndex(pm *model.PropagationMap) map[string]*model.PropagationMapApplication {
+	index := map[string]*model.PropagationMapApplication{}
+	if pm == nil {
+		return index
+	}
+	for _, a := range pm.Applications {
+		if a != nil {
+			index[a.Id.String()] = a
+		}
+	}
+	return index
+}
+
+func propagationEdges(pm *model.PropagationMap, app *model.Application, top *model.RCACandidate) []propagationEdgeCandidate {
+	index := propagationMapIndex(pm)
+	seeded := candidatePropagationEdges(index, top)
+	var res []propagationEdgeCandidate
+	order := 0
+	for _, a := range pm.Applications {
+		if a == nil {
+			continue
+		}
+		for _, u := range a.Upstreams {
+			if u == nil {
+				continue
+			}
+			key := propagationEdgeKey(a.Id, u.Id)
+			res = append(res, propagationEdgeCandidate{
+				Src:    a.Id,
+				Dst:    u.Id,
+				Link:   u,
+				Score:  propagationEdgeScore(a, index[u.Id.String()], u, app, top),
+				Seeded: seeded.Has(key),
+				Order:  order,
+			})
+			order++
+		}
+	}
+	return res
+}
+
+func candidatePropagationEdges(index map[string]*model.PropagationMapApplication, top *model.RCACandidate) *utils.StringSet {
+	edges := utils.NewStringSet()
+	if top == nil {
+		return edges
+	}
+	if src, dst, ok := dependencyComponentIds(index, top.Component); ok {
+		edges.Add(propagationEdgeKey(src, dst))
+	}
+	if top.PyRCAScores != nil {
+		for _, path := range top.PyRCAScores.GraphPaths {
+			var prev model.ApplicationId
+			prevOK := false
+			for _, item := range path {
+				id, ok := propagationMapId(index, item)
+				if !ok {
+					continue
+				}
+				if prevOK && prev != id {
+					edges.Add(propagationEdgeKey(prev, id))
+				}
+				prev, prevOK = id, true
+			}
+		}
+	}
+	return edges
+}
+
+func dependencyComponentIds(index map[string]*model.PropagationMapApplication, component string) (model.ApplicationId, model.ApplicationId, bool) {
+	parts := strings.Split(component, "->")
+	if len(parts) != 2 {
+		return model.ApplicationId{}, model.ApplicationId{}, false
+	}
+	src, srcOK := propagationMapId(index, parts[0])
+	dst, dstOK := propagationMapId(index, parts[1])
+	return src, dst, srcOK && dstOK
+}
+
+func topComponentId(top *model.RCACandidate) string {
+	if top == nil || strings.Contains(top.Component, "->") {
+		return ""
+	}
+	return top.Component
+}
+
+func propagationMapId(index map[string]*model.PropagationMapApplication, raw string) (model.ApplicationId, bool) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" || strings.HasPrefix(raw, "node:") {
+		return model.ApplicationId{}, false
+	}
+	if a := index[raw]; a != nil {
+		return a.Id, true
+	}
+	if id, err := model.NewApplicationIdFromString(raw, ""); err == nil {
+		if a := index[id.String()]; a != nil {
+			return a.Id, true
+		}
+	}
+	for _, a := range index {
+		if a.Id.Name == raw || applicationDisplayName(a.Id) == raw {
+			return a.Id, true
+		}
+	}
+	return model.ApplicationId{}, false
+}
+
+func propagationEdgeScore(src, dst *model.PropagationMapApplication, link *model.PropagationMapApplicationLink, app *model.Application, top *model.RCACandidate) int {
+	score := 0
+	if src == nil || link == nil {
+		return score
+	}
+	if app != nil && (src.Id == app.Id || link.Id == app.Id) {
+		score += 80
+	}
+	if top != nil {
+		if strings.Contains(top.Component, src.Id.String()) || strings.Contains(top.Component, link.Id.String()) {
+			score += 45
+		}
+	}
+	score += statusScore(src.Status)
+	if dst != nil {
+		score += statusScore(dst.Status)
+	}
+	score += statusScore(link.Status)
+	for _, issue := range src.Issues {
+		score += issueScore(issue)
+	}
+	if dst != nil {
+		for _, issue := range dst.Issues {
+			score += issueScore(issue)
+		}
+	}
+	if link.Stats != nil {
+		score += 12 * link.Stats.Len()
+		for _, stat := range link.Stats.Items() {
+			score += issueScore(stat)
+		}
+	}
+	if link.Id.Kind == model.ApplicationKindExternalService {
+		score -= 20
+		if len(link.Id.Name) > 48 {
+			score -= 10
+		}
+	}
+	switch link.Id.Kind {
+	case model.ApplicationKindDatabaseCluster, model.ApplicationKindRds, model.ApplicationKindElasticacheCluster, model.ApplicationKindStatefulSet:
+		score += 14
+	}
+	return score
+}
+
+func statusScore(status model.Status) int {
+	switch {
+	case status >= model.CRITICAL:
+		return 35
+	case status >= model.WARNING:
+		return 18
+	default:
+		return 0
+	}
+}
+
+func issueScore(issue string) int {
+	issue = strings.ToLower(markdownText(issue))
+	switch {
+	case strings.Contains(issue, "tcp retransmissions"):
+		return 22
+	case strings.Contains(issue, "connectivity") || strings.Contains(issue, "failed"):
+		return 20
+	case strings.Contains(issue, "latency"):
+		return 16
+	case strings.Contains(issue, "errors") || strings.Contains(issue, "log"):
+		return 14
+	case strings.Contains(issue, "cpu"):
+		return 18
+	case strings.Contains(issue, "storage"):
+		return 12
+	default:
+		return 4
+	}
+}
+
+func rebuildPropagationMap(pm *model.PropagationMap, keepNodes *utils.StringSet, keepEdges map[string]*propagationEdgeCandidate) *model.PropagationMap {
+	res := &model.PropagationMap{}
+	clones := map[string]*model.PropagationMapApplication{}
+	for _, a := range pm.Applications {
+		if a == nil || !keepNodes.Has(a.Id.String()) {
+			continue
+		}
+		clone := &model.PropagationMapApplication{
+			Id:          a.Id,
+			Icon:        a.Icon,
+			Labels:      a.Labels,
+			Status:      a.Status,
+			Issues:      append([]string{}, a.Issues...),
+			Upstreams:   []*model.PropagationMapApplicationLink{},
+			Downstreams: []*model.PropagationMapApplicationLink{},
+		}
+		clones[a.Id.String()] = clone
+		res.Applications = append(res.Applications, clone)
+	}
+	for _, e := range keepEdges {
+		src := clones[e.Src.String()]
+		dst := clones[e.Dst.String()]
+		if src == nil || dst == nil || e.Link == nil {
+			continue
+		}
+		src.Upstreams = append(src.Upstreams, clonePropagationLink(e.Link))
+		dst.Downstreams = append(dst.Downstreams, &model.PropagationMapApplicationLink{Id: e.Src, Status: model.UNKNOWN})
+	}
+	for _, a := range res.Applications {
+		sort.Slice(a.Upstreams, func(i, j int) bool { return a.Upstreams[i].Id.String() < a.Upstreams[j].Id.String() })
+		sort.Slice(a.Downstreams, func(i, j int) bool { return a.Downstreams[i].Id.String() < a.Downstreams[j].Id.String() })
+	}
+	return res
+}
+
+func clonePropagationLink(link *model.PropagationMapApplicationLink) *model.PropagationMapApplicationLink {
+	if link == nil {
+		return nil
+	}
+	var stats *utils.StringSet
+	if link.Stats != nil {
+		stats = utils.NewStringSet(link.Stats.Items()...)
+	}
+	return &model.PropagationMapApplicationLink{Id: link.Id, Status: link.Status, Stats: stats}
+}
+
+func propagationEdgeKey(src, dst model.ApplicationId) string {
+	return src.String() + "->" + dst.String()
+}
+
 func sortedConnections(connections map[model.ApplicationId]*model.AppToAppConnection, upstream bool) []*model.AppToAppConnection {
 	res := make([]*model.AppToAppConnection, 0, len(connections))
 	for _, c := range connections {
@@ -1518,7 +1841,7 @@ func renderSummary(rca *model.RCA, app *model.Application, candidates []*model.R
 	writeTraceEvidence(&details, req, traceWidgets, missing)
 
 	details.WriteString("## Kubernetes Events Confirmation\n\n")
-	writeKubernetesEvents(&details, req.KubernetesEvents)
+	writeKubernetesEvents(&details, req.KubernetesEvents, app, top, rca.PropagationMap)
 
 	rca.DetailedRootCause = details.String()
 	rca.ImmediateFixes = immediateFixes(top)
@@ -1618,7 +1941,7 @@ func writeCascadingImpact(b *strings.Builder, app *model.Application, top *model
 			if dstApp := propagationMapApplicationById(pm, u.Id); dstApp != nil && len(dstApp.Issues) > 0 {
 				b.WriteString(fmt.Sprintf(" The upstream side `%s` reported `%s`.", dst, strings.Join(dstApp.Issues, "`, `")))
 			}
-			b.WriteString("\n\n")
+			b.WriteString(fmt.Sprintf(" Evidence chain: `%s`, `component:%s`, `component:%s`.\n\n", evidenceEdgeId(a.Id, u.Id), a.Id.String(), u.Id.String()))
 			edges++
 		}
 	}
@@ -1706,7 +2029,7 @@ func writeCPUContentionImpact(b *strings.Builder, app *model.Application, top *m
 				if dstApp := propagationMapApplicationById(pm, u.Id); dstApp != nil && len(dstApp.Issues) > 0 {
 					b.WriteString(fmt.Sprintf(" The upstream side `%s` reported `%s`.", dst, strings.Join(dstApp.Issues, "`, `")))
 				}
-				b.WriteString("\n\n")
+				b.WriteString(fmt.Sprintf(" Evidence chain: `%s`, `component:%s`, `component:%s`.\n\n", evidenceEdgeId(a.Id, u.Id), a.Id.String(), u.Id.String()))
 				wrote = true
 			}
 		}
@@ -1920,23 +2243,105 @@ func traceSummary(trace *model.Trace) string {
 	return strings.Join(parts, " ")
 }
 
-func writeKubernetesEvents(b *strings.Builder, events []*model.LogEntry) {
+func writeKubernetesEvents(b *strings.Builder, events []*model.LogEntry, app *model.Application, top *model.RCACandidate, pm *model.PropagationMap) {
 	if len(events) == 0 {
 		b.WriteString("No Kubernetes events were available for this incident window.\n")
 		return
 	}
-	limit := len(events)
+	matched := relevantKubernetesEvents(events, app, top, pm)
+	if len(matched) == 0 {
+		b.WriteString("Kubernetes events were available in the incident window, but none directly matched the impacted service, the top RCA candidate, or the focused propagation path. They were not used as confirmation evidence.\n")
+		return
+	}
+	limit := len(matched)
 	if limit > 5 {
 		limit = 5
 	}
 	for i := 0; i < limit; i++ {
-		e := events[i]
+		e := matched[i]
 		body := sanitizeText(e.Body)
 		if len(body) > 240 {
 			body = body[:240] + "..."
 		}
 		b.WriteString(fmt.Sprintf("- `%s`: %s\n", e.Timestamp.Format("2006-01-02 15:04:05 UTC"), body))
 	}
+}
+
+func relevantKubernetesEvents(events []*model.LogEntry, app *model.Application, top *model.RCACandidate, pm *model.PropagationMap) []*model.LogEntry {
+	keywords := kubernetesEventKeywords(app, top, pm)
+	var matched []*model.LogEntry
+	for _, e := range events {
+		body := strings.ToLower(sanitizeText(e.Body))
+		attrs := strings.ToLower(strings.Join(kubernetesEventAttributeValues(e), " "))
+		for _, kw := range keywords.Items() {
+			if kw == "" {
+				continue
+			}
+			if strings.Contains(body, kw) || strings.Contains(attrs, kw) {
+				matched = append(matched, e)
+				break
+			}
+		}
+	}
+	return matched
+}
+
+func kubernetesEventKeywords(app *model.Application, top *model.RCACandidate, pm *model.PropagationMap) *utils.StringSet {
+	keywords := utils.NewStringSet()
+	addName := func(name string) {
+		name = strings.ToLower(strings.TrimSpace(name))
+		if len(name) >= 3 {
+			keywords.Add(name)
+		}
+	}
+	if app != nil {
+		addName(app.Id.Name)
+	}
+	if top != nil {
+		addName(componentDisplayName(top.Component))
+		for _, ref := range top.EvidenceRefs {
+			if strings.HasPrefix(ref, "node:") {
+				addName(strings.TrimPrefix(ref, "node:"))
+			}
+		}
+		switch top.Scenario {
+		case "network_chaos_delay":
+			keywords.Add("networkchaos", "chaos mesh", "chaos-mesh", "net-delay", "network delay")
+		case "cronjob_node_cpu_starvation":
+			keywords.Add("cronjob", "job", "scheduled", "assigned")
+		case "bad_deployment", "deployment_change", "bad_deployment_db_query_amplification":
+			keywords.Add("deployment", "rollout", "replicaset")
+		case "recommendation_memory_leak", "resource_exhaustion":
+			keywords.Add("oomkilled", "out of memory", "back-off", "crashloop")
+		}
+		if src, dst := dependencyComponentNames(top.Component); src != "" || dst != "" {
+			addName(src)
+			addName(dst)
+		}
+	}
+	if pm != nil {
+		for _, a := range pm.Applications {
+			if a == nil {
+				continue
+			}
+			addName(a.Id.Name)
+		}
+	}
+	return keywords
+}
+
+func kubernetesEventAttributeValues(e *model.LogEntry) []string {
+	if e == nil {
+		return nil
+	}
+	var values []string
+	values = append(values, e.ServiceName, e.ClusterId, e.ClusterName)
+	for _, attrs := range []map[string]string{e.LogAttributes, e.ResourceAttributes} {
+		for k, v := range attrs {
+			values = append(values, k, v)
+		}
+	}
+	return values
 }
 
 func applicationDisplayName(id model.ApplicationId) string {
