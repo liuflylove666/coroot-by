@@ -4,11 +4,13 @@ import (
 	"context"
 	"net/http"
 
+	aiintegration "github.com/coroot/coroot/ai"
 	"github.com/coroot/coroot/clickhouse"
 	"github.com/coroot/coroot/cloud"
 	"github.com/coroot/coroot/constructor"
 	"github.com/coroot/coroot/db"
 	"github.com/coroot/coroot/model"
+	localrca "github.com/coroot/coroot/rca"
 	"github.com/coroot/coroot/timeseries"
 	"github.com/coroot/coroot/utils"
 	"github.com/gorilla/mux"
@@ -26,19 +28,11 @@ func (api *Api) RCA(w http.ResponseWriter, r *http.Request, u *db.User) {
 			if err := api.db.UpdateIncidentRCA(projectId, incident, rca); err != nil {
 				klog.Errorln(err)
 			}
+			api.saveRCACase(projectId, incident, rca)
 		} else {
 			utils.WriteJson(w, rca)
 		}
 	}()
-
-	cloudAPI := cloud.API(api.db, api.deploymentUuid, api.instanceUuid, r.Referer())
-	if status, err := cloudAPI.RCAStatus(r.Context(), false); status != "OK" {
-		rca.Status = status
-		if err != nil {
-			rca.Error = err.Error()
-		}
-		return
-	}
 
 	project, err := api.db.GetProject(projectId)
 	if err != nil {
@@ -125,6 +119,14 @@ func (api *Api) RCA(w http.ResponseWriter, r *http.Request, u *db.User) {
 		return
 	}
 
+	world, _, _, err := api.LoadWorldByRequest(r)
+	if err != nil {
+		klog.Errorln(err)
+		rca.Status = "Failed"
+		rca.Error = err.Error()
+		return
+	}
+
 	var ch *clickhouse.Client
 	if ch, err = api.GetClickhouseClient(project, ""); err != nil {
 		klog.Errorln(err)
@@ -136,39 +138,43 @@ func (api *Api) RCA(w http.ResponseWriter, r *http.Request, u *db.User) {
 			klog.Errorln(err)
 		}
 
-		func() {
-			world, _, _, err := api.LoadWorldByRequest(r)
-			if err != nil {
-				klog.Errorln(err)
-				return
-			}
-			app := world.GetApplication(appId)
-			if app == nil {
-				return
-			}
+		app := world.GetApplication(appId)
+		if app != nil {
 			rcaRequest.ErrorTrace, rcaRequest.SlowTrace, err = ch.GetTracesViolatingSLOs(r.Context(), rcaRequest.Ctx.From, rcaRequest.Ctx.To, world, app)
 			if err != nil {
 				klog.Errorln(err)
-				return
 			}
-		}()
+		}
 	}
 
-	rcaResponse, err := cloudAPI.RCA(r.Context(), rcaRequest)
-	if err != nil {
-		klog.Errorln(err)
-		rca.Status = "Failed"
-		rca.Error = err.Error()
+	cloudAPI := cloud.API(api.db, api.deploymentUuid, api.instanceUuid, r.Referer())
+	if status, statusErr := cloudAPI.RCAStatus(r.Context(), false); status == "OK" {
+		rcaResponse, err := cloudAPI.RCA(r.Context(), rcaRequest)
+		if err != nil {
+			klog.Errorln(err)
+			rca.Status = "Failed"
+			rca.Error = err.Error()
+			return
+		}
+		rca = rcaResponse
+		rca.Status = "OK"
 		return
+	} else if statusErr != nil {
+		klog.Warningln("Cloud RCA is unavailable, using built-in RCA:", statusErr)
 	}
-	rca = rcaResponse
-	rca.Status = "OK"
+	rca = api.localRCAWithAI(r.Context(), project.Id, rcaRequest, world, incident, false)
 }
 
 func (api *Api) IncidentRCA(ctx context.Context, project *db.Project, world *model.World, incident *model.ApplicationIncident) {
 	rca := incident.RCA
 	if rca != nil && rca.Status == "OK" {
 		return
+	}
+	aiSettings := aiintegration.DefaultSettings()
+	if s, err := aiintegration.LoadSettings(api.db); err != nil {
+		klog.Errorln(err)
+	} else {
+		aiSettings = s
 	}
 	if rca == nil {
 		rca = &model.RCA{}
@@ -177,16 +183,9 @@ func (api *Api) IncidentRCA(ctx context.Context, project *db.Project, world *mod
 		if err := api.db.UpdateIncidentRCA(project.Id, incident, rca); err != nil {
 			klog.Errorln(err)
 		}
+		api.saveRCACase(project.Id, incident, rca)
 	}()
 
-	cloudAPI := cloud.API(api.db, api.deploymentUuid, api.instanceUuid, "")
-	if status, err := cloudAPI.RCAStatus(ctx, true); status != "OK" {
-		rca.Status = status
-		if err != nil {
-			rca.Error = err.Error()
-		}
-		return
-	}
 	if incident.RCA == nil {
 		if err := api.db.UpdateIncidentRCA(project.Id, incident, &model.RCA{Status: "In progress"}); err != nil {
 			klog.Errorln(err)
@@ -252,15 +251,63 @@ func (api *Api) IncidentRCA(ctx context.Context, project *db.Project, world *mod
 		}
 	}
 
-	rcaResponse, err := cloudAPI.RCA(ctx, rcaRequest)
-	if err != nil {
-		klog.Errorln(err)
-		rca.Status = "Failed"
-		rca.Error = err.Error()
+	cloudAPI := cloud.API(api.db, api.deploymentUuid, api.instanceUuid, "")
+	if status, statusErr := cloudAPI.RCAStatus(ctx, true); status == "OK" {
+		rcaResponse, err := cloudAPI.RCA(ctx, rcaRequest)
+		if err != nil {
+			klog.Errorln(err)
+			rca.Status = "Failed"
+			rca.Error = err.Error()
+			return
+		}
+		rca = rcaResponse
+		rca.Status = "OK"
+		return
+	} else if statusErr != nil {
+		klog.Warningln("Cloud RCA is unavailable, using built-in RCA:", statusErr)
+	}
+	if !aiSettings.IncidentsAutoRCA {
+		rca.Status = "AI disabled"
 		return
 	}
-	rca = rcaResponse
-	rca.Status = "OK"
+	rca = api.localRCAWithAI(ctx, project.Id, rcaRequest, world, incident, true)
+}
+
+func (api *Api) localRCAWithAI(ctx context.Context, projectId db.ProjectId, req cloud.RCARequest, world *model.World, incident *model.ApplicationIncident, auto bool) *model.RCA {
+	res := localrca.BuiltIn(req, world, incident)
+	if cases, err := api.db.FindSimilarRCACases(projectId, res, 3); err != nil {
+		klog.Warningln("failed to load historical RCA cases:", err)
+	} else {
+		res.HistoricalContext = cases
+	}
+	settings, err := aiintegration.LoadSettings(api.db)
+	if err != nil {
+		klog.Errorln(err)
+		return res
+	}
+	if auto && !settings.IncidentsAutoRCA {
+		return res
+	}
+	if !settings.Enabled() {
+		return res
+	}
+	enhanced, err := localrca.EnhanceWithAI(ctx, res, settings)
+	if err != nil {
+		klog.Warningln("AI RCA rendering failed, keeping built-in RCA:", err)
+		res.Error = "AI RCA failed: " + err.Error()
+		return res
+	}
+	localrca.PostProcess(enhanced)
+	return enhanced
+}
+
+func (api *Api) saveRCACase(projectId db.ProjectId, incident *model.ApplicationIncident, rca *model.RCA) {
+	if incident == nil || rca == nil || rca.Status != "OK" {
+		return
+	}
+	if err := api.db.SaveRCACase(projectId, incident.Key, incident.ApplicationId, rca); err != nil {
+		klog.Warningln("failed to save RCA case:", err)
+	}
 }
 
 func (api *Api) IncidentTimeContext(projectId db.ProjectId, incident *model.ApplicationIncident, now timeseries.Time) (timeseries.Time, timeseries.Time) {

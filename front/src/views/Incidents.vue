@@ -90,11 +90,16 @@
             </template>
 
             <template #item.rca="{ item }">
-                <div>
+                <div class="d-flex align-center text-no-wrap" style="gap: 4px">
                     <template v-if="item.rca">
                         <v-icon v-if="item.rca.status === 'OK'" small color="success">mdi-check-circle</v-icon>
+                        <v-icon v-else-if="item.rca.status === 'In progress'" small color="primary">mdi-progress-clock</v-icon>
+                        <v-icon v-else-if="item.rca.status === 'AI disabled'" small color="grey">mdi-robot-off-outline</v-icon>
                         <v-icon v-else-if="item.rca.status === 'Failed'" small color="error">mdi-alert-circle</v-icon>
-                        <span v-else class="grey--text">{{ item.rca.status }}</span>
+                        <v-icon v-else small color="grey">mdi-information-outline</v-icon>
+                        <span :class="{ 'grey--text': item.rca.status !== 'OK', 'green--text': item.rca.status === 'OK' }">
+                            {{ rcaStatus(item.rca) }}
+                        </span>
                     </template>
                     <span v-else class="grey--text">&mdash;</span>
                 </div>
@@ -249,6 +254,18 @@ export default {
         },
         edit(app_id, check_id, check_title) {
             this.editing = { active: true, appId: app_id, check: { id: check_id, title: check_title } };
+        },
+        rcaStatus(rca) {
+            if (!rca) {
+                return '';
+            }
+            if (rca.status === 'OK') {
+                return 'Done';
+            }
+            if (rca.error && rca.error.toLowerCase().includes('provider')) {
+                return 'Provider error';
+            }
+            return rca.status || '-';
         },
     },
 };

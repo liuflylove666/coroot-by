@@ -4,10 +4,10 @@
             Too many applications ({{ tooManyApplications }}) to render. Please choose a different category or namespace.
         </div>
 
-        <div class="applications" v-on-resize="calc" @scroll="calc">
+        <div class="applications" v-on-resize="calc" @scroll="calc" @mousemove="syncHover" @mouseleave="clearHover">
             <div v-for="apps in levels" class="level" style="z-index: 1; row-gap: 20px">
                 <div v-for="a in apps" style="text-align: center">
-                    <div :ref="a.id" class="app" @mouseenter="hi = a.id" @mouseleave="hi = null">
+                    <div :ref="a.id" class="app" :data-app-id="a.id" @mouseenter="setHover(a.id)" @mouseleave="clearHover">
                         <div class="d-flex align-center">
                             <div class="flex-grow-1 name">
                                 <router-link :to="{ name: 'overview', params: { view: 'applications', id: a.id }, query: $utils.contextQuery() }">
@@ -114,6 +114,11 @@ export default {
 
     mounted() {
         this.calc();
+        document.addEventListener('mousemove', this.syncDocumentHover);
+    },
+
+    beforeDestroy() {
+        document.removeEventListener('mousemove', this.syncDocumentHover);
     },
 
     watch: {
@@ -250,6 +255,27 @@ export default {
                 });
             });
             this.arrows = arrows;
+        },
+        syncHover(e) {
+            const app = e.target && e.target.closest ? e.target.closest('.app') : null;
+            this.setHover(app && app.dataset ? app.dataset.appId : null);
+        },
+        syncDocumentHover(e) {
+            const applications = this.$el.querySelector('.applications');
+            if (!applications || !applications.contains(e.target)) {
+                this.clearHover();
+                return;
+            }
+            this.syncHover(e);
+        },
+        setHover(id) {
+            if (this.hi === id) {
+                return;
+            }
+            this.hi = id;
+        },
+        clearHover() {
+            this.setHover(null);
         },
     },
 };

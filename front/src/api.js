@@ -162,6 +162,10 @@ export default class Api {
         }
     }
 
+    aiTest(form, cb) {
+        this.post(`ai/test`, form, cb);
+    }
+
     getProject(projectId, cb) {
         this.get(`project/${projectId || ''}`, {}, cb);
     }
@@ -312,6 +316,22 @@ export default class Api {
         const params = { withSummary, from, to, incident, alert, rcaFrom, rcaTo };
         const url = this.projectPath(`app/${encodeURIComponent(appId)}/rca`);
         this.request({ method: 'get', url, params, timeout: withSummary ? 300000 : 60000 }, cb);
+    }
+
+    runIncidentRCA(incidentKey, cb) {
+        this.post(this.projectPath(`incident/${encodeURIComponent(incidentKey)}/rca`), {}, cb);
+    }
+
+    getIncidentRCAJob(incidentKey, cb) {
+        this.get(this.projectPath(`incident/${encodeURIComponent(incidentKey)}/rca/job`), {}, cb);
+    }
+
+    updateIncidentRCARemediation(incidentKey, actionId, form, cb) {
+        this.post(this.projectPath(`incident/${encodeURIComponent(incidentKey)}/rca/remediation/${encodeURIComponent(actionId)}`), form, cb);
+    }
+
+    getRCABenchmark(cb) {
+        this.get(`rca/benchmark`, {}, cb);
     }
 
     getInspectionConfig(appId, type, cb) {

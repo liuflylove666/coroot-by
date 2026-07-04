@@ -4,10 +4,6 @@
             Coroot leverages Large Language Models (LLMs) to automatically generate clear, concise summaries of root causes, helping your team
             troubleshoot faster.
         </p>
-        <v-alert v-if="disabled" color="info" outlined text>
-            Available exclusively in Coroot Enterprise (from $1 per CPU core/month).<br />
-            <a href="https://coroot.com/account" target="_blank" class="font-weight-bold">Start</a> your free trial today.
-        </v-alert>
         <v-alert v-if="readonly" color="primary" outlined text>
             AI settings are defined through the config and cannot be modified via the UI.
         </v-alert>
@@ -90,6 +86,14 @@
                 <v-text-field v-model="form.openai_compatible.model" :rules="[$validators.notEmpty]" outlined dense hide-details single-line />
             </template>
 
+            <v-checkbox
+                v-model="form.incidents_auto_rca"
+                label="Investigate incidents automatically"
+                dense
+                hide-details
+                class="mt-3"
+            />
+
             <v-alert v-if="error" color="red" icon="mdi-alert-octagon-outline" outlined text class="mt-3">
                 {{ error }}
             </v-alert>
@@ -98,8 +102,56 @@
             </v-alert>
             <div class="mt-3 d-flex" style="gap: 8px">
                 <v-btn color="primary" @click="save" :disabled="disabled || readonly || !valid || !changed" :loading="loading">Save</v-btn>
+                <v-btn @click="test" :disabled="disabled || !valid || form.provider === ''" :loading="testing">
+                    <v-icon small left>mdi-connection</v-icon>
+                    Test connection
+                </v-btn>
             </div>
         </v-form>
+
+        <v-divider class="my-5" />
+
+        <div class="subtitle-1">RCA Benchmark</div>
+        <div class="caption">
+            Demo parity fixture contract for NetworkChaos, bad deployment, CronJob CPU starvation, and recommendation memory leak scenarios.
+        </div>
+        <div class="mt-3">
+            <v-btn small outlined @click="loadBenchmark" :loading="benchmarkLoading">
+                <v-icon small left>mdi-chart-box-outline</v-icon>
+                Load benchmark
+            </v-btn>
+        </div>
+        <template v-if="benchmark">
+            <v-alert :color="benchmark.report.passed ? 'green' : 'orange'" outlined text class="mt-3">
+                {{ benchmark.mode }}:
+                {{ benchmark.report.passed ? 'passed' : 'needs attention' }}
+                ({{ benchmark.report.total }} fixtures)
+            </v-alert>
+            <v-simple-table dense class="benchmark-table">
+                <tbody>
+                    <tr>
+                        <td>Scenario Accuracy</td>
+                        <td>{{ formatPercent(benchmark.report.scenario_accuracy) }}</td>
+                    </tr>
+                    <tr>
+                        <td>Recall@1 / Recall@3</td>
+                        <td>{{ formatPercent(benchmark.report.root_component_recall_1) }} / {{ formatPercent(benchmark.report.root_component_recall_3) }}</td>
+                    </tr>
+                    <tr>
+                        <td>Reason Accuracy</td>
+                        <td>{{ formatPercent(benchmark.report.root_reason_accuracy) }}</td>
+                    </tr>
+                    <tr>
+                        <td>Grounding Rate</td>
+                        <td>{{ formatPercent(benchmark.report.grounding_rate) }}</td>
+                    </tr>
+                    <tr>
+                        <td>Unsafe Fixes</td>
+                        <td>{{ benchmark.report.unsafe_fixes }}</td>
+                    </tr>
+                </tbody>
+            </v-simple-table>
+        </template>
     </div>
 </template>
 
@@ -109,11 +161,14 @@ export default {
 
     data() {
         return {
-            disabled: this.$coroot.edition !== 'Enterprise',
+            disabled: false,
             readonly: false,
-            form: { provider: '', anthropic: {}, openai: {}, openai_compatible: {} },
+            form: { provider: '', anthropic: {}, openai: {}, openai_compatible: {}, incidents_auto_rca: true },
             valid: false,
             loading: false,
+            testing: false,
+            benchmarkLoading: false,
+            benchmark: null,
             error: '',
             message: '',
             saved: {},
@@ -144,6 +199,7 @@ export default {
                 this.form.anthropic = data.anthropic || {};
                 this.form.openai = data.openai || {};
                 this.form.openai_compatible = data.openai_compatible || {};
+                this.form.incidents_auto_rca = data.incidents_auto_rca !== false;
                 this.saved = JSON.parse(JSON.stringify(this.form));
             });
         },
@@ -165,8 +221,44 @@ export default {
                 this.get();
             });
         },
+        test() {
+            this.testing = true;
+            this.error = '';
+            this.message = '';
+            const form = JSON.parse(JSON.stringify(this.form));
+            this.$api.aiTest(form, (data, error) => {
+                this.testing = false;
+                if (error) {
+                    this.error = error;
+                    return;
+                }
+                this.message = `Connection successful: ${data.provider} / ${data.model}.`;
+                setTimeout(() => {
+                    this.message = '';
+                }, 3000);
+            });
+        },
+        loadBenchmark() {
+            this.benchmarkLoading = true;
+            this.error = '';
+            this.$api.getRCABenchmark((data, error) => {
+                this.benchmarkLoading = false;
+                if (error) {
+                    this.error = error;
+                    return;
+                }
+                this.benchmark = data;
+            });
+        },
+        formatPercent(value) {
+            return `${Math.round((value || 0) * 100)}%`;
+        },
     },
 };
 </script>
 
-<style scoped></style>
+<style scoped>
+.benchmark-table:deep(table) {
+    max-width: 520px;
+}
+</style>

@@ -142,7 +142,7 @@ func main() {
 		klog.Exitln(err)
 	}
 
-	incidents := watchers.NewIncidents(database, a.IncidentRCA)
+	incidents := watchers.NewIncidents(database, a.EnqueueIncidentRCA)
 
 	watchers.Start(database, promCache, pricing, incidents, !cfg.DoNotCheckForDeployments, globalClickhouse, globalPrometheus, cfg.ClickHouseSpaceManager, nil, nil)
 
@@ -175,6 +175,8 @@ func main() {
 	r.HandleFunc("/api/roles", a.Auth(a.Roles)).Methods(http.MethodGet, http.MethodPost)
 	r.HandleFunc("/api/sso", a.Auth(a.SSO)).Methods(http.MethodGet, http.MethodPost)
 	r.HandleFunc("/api/ai", a.Auth(a.AI)).Methods(http.MethodGet, http.MethodPost)
+	r.HandleFunc("/api/ai/test", a.Auth(a.AITest)).Methods(http.MethodPost)
+	r.HandleFunc("/api/rca/benchmark", a.Auth(a.RCABenchmark)).Methods(http.MethodGet)
 	r.HandleFunc("/api/cloud", a.Auth(a.Cloud)).Methods(http.MethodGet, http.MethodPost)
 	r.HandleFunc("/api/project/", a.Auth(a.Project)).Methods(http.MethodGet, http.MethodPost)
 	r.HandleFunc("/api/project/{project}", a.Auth(a.Project)).Methods(http.MethodGet, http.MethodPost, http.MethodDelete)
@@ -183,6 +185,9 @@ func main() {
 	r.HandleFunc("/api/project/{project}/overview/{view}", a.Auth(a.Overview)).Methods(http.MethodGet)
 	r.HandleFunc("/api/project/{project}/incidents", a.Auth(a.Incidents)).Methods(http.MethodGet)
 	r.HandleFunc("/api/project/{project}/incident/{incident}", a.Auth(a.Incident)).Methods(http.MethodGet)
+	r.HandleFunc("/api/project/{project}/incident/{incident}/rca", a.Auth(a.IncidentRCATask)).Methods(http.MethodPost)
+	r.HandleFunc("/api/project/{project}/incident/{incident}/rca/job", a.Auth(a.IncidentRCATask)).Methods(http.MethodGet)
+	r.HandleFunc("/api/project/{project}/incident/{incident}/rca/remediation/{action}", a.Auth(a.IncidentRCARemediation)).Methods(http.MethodPost)
 	r.HandleFunc("/api/project/{project}/alerts", a.Auth(a.Alerts)).Methods(http.MethodGet)
 	r.HandleFunc("/api/project/{project}/alerts/resolve", a.Auth(a.ResolveAlerts)).Methods(http.MethodPost)
 	r.HandleFunc("/api/project/{project}/alerts/suppress", a.Auth(a.SuppressAlerts)).Methods(http.MethodPost)

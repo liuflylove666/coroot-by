@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	aiintegration "github.com/coroot/coroot/ai"
 	"github.com/coroot/coroot/api/forms"
 	"github.com/coroot/coroot/api/views"
 	"github.com/coroot/coroot/auditor"
@@ -62,13 +63,14 @@ type Api struct {
 	instanceUuid   string
 
 	loadWorld LoadWorldF
+	rcaQueue  *RCAQueue
 }
 
 func NewApi(cfg *config.Config, cache *cache.Cache, db *db.DB, collector *collector.Collector, stats *stats.Collector, pricing *pricing.Manager, roles rbac.RoleManager, licenseMgr LicenseManager,
 	globalClickHouse *db.IntegrationClickhouse, globalPrometheus *db.IntegrationPrometheus,
 	deploymentUuid, instanceUuid string, loadWorld LoadWorldF) *Api {
 
-	return &Api{
+	a := &Api{
 		cfg:              cfg,
 		cache:            cache,
 		db:               db,
@@ -83,6 +85,8 @@ func NewApi(cfg *config.Config, cache *cache.Cache, db *db.DB, collector *collec
 		instanceUuid:     instanceUuid,
 		loadWorld:        loadWorld,
 	}
+	a.rcaQueue = newRCAQueue(a)
+	return a
 }
 
 func (api *Api) User(w http.ResponseWriter, r *http.Request, u *db.User) {
@@ -233,10 +237,80 @@ func (api *Api) SSO(w http.ResponseWriter, r *http.Request, u *db.User) {
 }
 
 func (api *Api) AI(w http.ResponseWriter, r *http.Request, u *db.User) {
-	res := struct {
-		Provider string `json:"provider"`
-	}{}
-	utils.WriteJson(w, res)
+	if !api.IsAllowed(u, rbac.Actions.Settings().Edit()) {
+		http.Error(w, "You are not allowed to edit global settings.", http.StatusForbidden)
+		return
+	}
+	settings, err := aiintegration.LoadSettings(api.db)
+	if err != nil {
+		klog.Errorln(err)
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
+	if r.Method == http.MethodPost {
+		var form aiintegration.Settings
+		if err = utils.ReadJson(r, &form); err != nil {
+			klog.Warningln("bad request:", err)
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		form = aiintegration.MergeMaskedKeys(form, settings)
+		if err = aiintegration.SaveSettings(api.db, form); err != nil {
+			klog.Warningln("failed to save AI settings:", err)
+			switch {
+			case errors.Is(err, db.ErrReadonly):
+				http.Error(w, "AI settings are read-only.", http.StatusForbidden)
+			default:
+				http.Error(w, err.Error(), http.StatusBadRequest)
+			}
+			return
+		}
+		return
+	}
+	utils.WriteJson(w, settings.Masked())
+}
+
+func (api *Api) AITest(w http.ResponseWriter, r *http.Request, u *db.User) {
+	if !api.IsAllowed(u, rbac.Actions.Settings().Edit()) {
+		http.Error(w, "You are not allowed to edit global settings.", http.StatusForbidden)
+		return
+	}
+	settings, err := aiintegration.LoadSettings(api.db)
+	if err != nil {
+		klog.Errorln(err)
+		http.Error(w, "", http.StatusInternalServerError)
+		return
+	}
+	if r.Method == http.MethodPost {
+		var form aiintegration.Settings
+		if err = utils.ReadJson(r, &form); err != nil {
+			klog.Warningln("bad request:", err)
+			http.Error(w, "", http.StatusBadRequest)
+			return
+		}
+		settings = aiintegration.MergeMaskedKeys(form, settings)
+		settings.Readonly = false
+	}
+	settings.Provider = strings.TrimSpace(settings.Provider)
+	if err = settings.Validate(); err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	provider, err := aiintegration.NewProvider(settings)
+	if err != nil {
+		http.Error(w, err.Error(), http.StatusBadRequest)
+		return
+	}
+	if err = provider.Validate(r.Context()); err != nil {
+		klog.Warningln("AI test connection failed:", err)
+		http.Error(w, err.Error(), http.StatusBadGateway)
+		return
+	}
+	utils.WriteJson(w, map[string]string{
+		"status":   "ok",
+		"provider": provider.Name(),
+		"model":    provider.Model(),
+	})
 }
 
 func (api *Api) Project(w http.ResponseWriter, r *http.Request, u *db.User) {
@@ -1155,6 +1229,11 @@ func (api *Api) Incident(w http.ResponseWriter, r *http.Request, u *db.User) {
 		}
 		klog.Warningln("failed to get incident:", err)
 		http.Error(w, "failed to get incident", http.StatusInternalServerError)
+		return
+	}
+	if err := api.overlayRCARemediationState(db.ProjectId(projectId), incident); err != nil {
+		klog.Errorln("failed to load RCA remediation state:", err)
+		http.Error(w, "", http.StatusInternalServerError)
 		return
 	}
 	values := r.URL.Query()

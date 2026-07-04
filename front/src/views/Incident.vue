@@ -172,6 +172,137 @@
                                     class="mb-5"
                                 />
                                 <Markdown :src="incident.rca.detailed_root_cause_analysis" :widgets="incident.rca.widgets || []" />
+
+                                <div v-if="showRcaDiagnostics">
+                                <template v-if="topCandidates.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">Root Cause Candidates</div>
+                                    <v-simple-table dense class="candidate-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Rank</th>
+                                                <th>Component</th>
+                                                <th>Reason</th>
+                                                <th>Scenario</th>
+                                                <th>Score</th>
+                                                <th>PyRCA</th>
+                                                <th>Evidence</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="(c, idx) in topCandidates" :key="c.id || idx">
+                                                <td>{{ idx + 1 }}</td>
+                                                <td class="text-no-wrap">{{ c.component }}</td>
+                                                <td>{{ c.root_cause_reason }}</td>
+                                                <td>{{ c.scenario || '-' }}</td>
+                                                <td class="text-no-wrap">{{ formatScore(c.score) }} / {{ c.confidence }}</td>
+                                                <td class="text-no-wrap">{{ formatPyRCAScore(c) }}</td>
+                                                <td class="evidence">{{ candidateEvidence(c) }}</td>
+                                            </tr>
+                                        </tbody>
+                                    </v-simple-table>
+                                </template>
+
+                                <template v-if="missingEvidence.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">Missing Evidence</div>
+                                    <v-chip v-for="m in missingEvidence" :key="m" small outlined class="mr-2 mb-2">{{ m }}</v-chip>
+                                </template>
+
+                                <template v-if="rcaAudit.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">RCA Audit</div>
+                                    <v-chip v-for="a in rcaAudit" :key="a" small outlined class="mr-2 mb-2">{{ a }}</v-chip>
+                                </template>
+
+                                <template v-if="grounding">
+                                    <div class="mt-5 mb-2 text-subtitle-1">Grounding</div>
+                                    <v-chip small outlined class="mr-2 mb-2" :color="groundingColor">
+                                        {{ grounding.status }} / risk: {{ grounding.hallucination_risk }}
+                                    </v-chip>
+                                    <v-chip small outlined class="mr-2 mb-2">evidence coverage: {{ formatScore(grounding.evidence_coverage) }}</v-chip>
+                                    <v-alert v-if="grounding.issues && grounding.issues.length" dense outlined type="warning" class="mt-2">
+                                        <div v-for="issue in grounding.issues" :key="issue">{{ issue }}</div>
+                                    </v-alert>
+                                </template>
+
+                                <template v-if="remediation.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">Recommended Actions</div>
+                                    <v-simple-table dense class="remediation-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Action</th>
+                                                <th>Risk</th>
+                                                <th>Evidence</th>
+                                                <th>Verification</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="a in remediation" :key="a.id">
+                                                <td>
+                                                    <div class="font-weight-medium">{{ a.title }}</div>
+                                                    <div class="caption grey--text">{{ a.description }}</div>
+                                                </td>
+                                                <td class="text-no-wrap">
+                                                    <v-chip x-small outlined :color="remediationRiskColor(a.risk)">{{ a.risk }}</v-chip>
+                                                    <div v-if="a.requires_approval" class="mt-1">
+                                                        <v-chip x-small outlined color="warning">review required</v-chip>
+                                                    </div>
+                                                </td>
+                                                <td class="evidence">{{ remediationEvidence(a) }}</td>
+                                                <td>
+                                                    <div>{{ a.verification || '-' }}</div>
+                                                    <div v-if="a.verification_status" class="caption mt-1" :class="a.verification_status === 'passed' ? 'green--text' : 'red--text'">
+                                                        {{ a.verification_status }}
+                                                    </div>
+                                                    <div v-if="a.verification_note" class="caption grey--text">{{ a.verification_note }}</div>
+                                                </td>
+                                            </tr>
+                                        </tbody>
+                                    </v-simple-table>
+                                </template>
+
+                                <template v-if="historicalContext.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">Historical Context</div>
+                                    <v-simple-table dense class="history-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Incident</th>
+                                                <th>Scenario</th>
+                                                <th>Component</th>
+                                                <th>Similarity</th>
+                                                <th>Previous fix</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="h in historicalContext" :key="h.incident_key">
+                                                <td class="text-no-wrap">{{ h.incident_key }}</td>
+                                                <td>{{ h.scenario }}</td>
+                                                <td>{{ h.component }}</td>
+                                                <td>{{ formatScore(h.similarity) }}</td>
+                                                <td>{{ h.fix_summary || '-' }}</td>
+                                            </tr>
+                                        </tbody>
+                                    </v-simple-table>
+                                </template>
+
+                                <template v-if="trajectory.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">Investigation Steps</div>
+                                    <v-simple-table dense class="trajectory-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Step</th>
+                                                <th>Tool</th>
+                                                <th>Observation</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="s in trajectory" :key="s.step">
+                                                <td>{{ s.step }}</td>
+                                                <td class="text-no-wrap">{{ s.tool }}</td>
+                                                <td>{{ s.output_summary }}</td>
+                                            </tr>
+                                        </tbody>
+                                    </v-simple-table>
+                                </template>
+                                </div>
                             </v-card>
                         </template>
                     </template>
@@ -238,6 +369,58 @@ export default {
                 { name: 'traces', title: 'traces', icon: 'mdi-chart-timeline' },
             ];
         },
+        topCandidates() {
+            const candidates = this.incident?.rca?.candidates || [];
+            return candidates.slice(0, 3);
+        },
+        missingEvidence() {
+            return this.incident?.rca?.missing_evidence || [];
+        },
+        rcaAudit() {
+            const rca = this.incident?.rca || {};
+            const res = [];
+            if (rca.provider) {
+                res.push(`provider: ${rca.provider}`);
+            }
+            if (rca.model) {
+                res.push(`model: ${rca.model}`);
+            }
+            if (rca.validator_result) {
+                res.push(`validator: ${rca.validator_result}`);
+            }
+            if (rca.input_tokens) {
+                res.push(`input tokens: ${rca.input_tokens}`);
+            }
+            if (rca.output_tokens) {
+                res.push(`output tokens: ${rca.output_tokens}`);
+            }
+            if (rca.latency_ms) {
+                res.push(`latency: ${rca.latency_ms} ms`);
+            }
+            return res;
+        },
+        trajectory() {
+            return this.incident?.rca?.trajectory || [];
+        },
+        grounding() {
+            return this.incident?.rca?.grounding || null;
+        },
+        groundingColor() {
+            switch (this.grounding?.status) {
+                case 'grounded':
+                    return 'success';
+                case 'unsafe':
+                    return 'error';
+                default:
+                    return 'warning';
+            }
+        },
+        remediation() {
+            return this.incident?.rca?.remediation || [];
+        },
+        historicalContext() {
+            return this.incident?.rca?.historical_context || [];
+        },
     },
 
     data() {
@@ -249,12 +432,18 @@ export default {
                 active: false,
             },
             show_details: false,
+            showRcaDiagnostics: false,
+            rcaJobPoller: null,
         };
     },
 
     mounted() {
         this.get();
         this.$events.watch(this, this.get, 'refresh');
+    },
+
+    beforeDestroy() {
+        this.stopRCAJobPolling();
     },
 
     methods: {
@@ -274,14 +463,83 @@ export default {
         },
         refresh_rca() {
             this.loading = true;
-            this.$api.getRCA(this.incident.application_id, true, (data, error) => {
+            this.stopRCAJobPolling();
+            this.$api.runIncidentRCA(this.incident.key, (data, error) => {
                 this.loading = false;
                 if (error) {
-                    // this.error = error;
+                    this.error = error;
                     return;
                 }
-                this.get();
+                this.incident.rca = { ...(this.incident.rca || {}), status: 'In progress' };
+                this.pollRCAJob();
             });
+        },
+        pollRCAJob() {
+            this.stopRCAJobPolling();
+            this.rcaJobPoller = setTimeout(() => {
+                if (!this.incident?.key) {
+                    return;
+                }
+                this.$api.getIncidentRCAJob(this.incident.key, (job, error, status) => {
+                    if (error && status !== 404) {
+                        this.get();
+                        return;
+                    }
+                    if (!job || job.status === 'queued' || job.status === 'running') {
+                        this.pollRCAJob();
+                        return;
+                    }
+                    this.stopRCAJobPolling();
+                    this.get();
+                });
+            }, 5000);
+        },
+        stopRCAJobPolling() {
+            if (this.rcaJobPoller) {
+                clearTimeout(this.rcaJobPoller);
+                this.rcaJobPoller = null;
+            }
+        },
+        formatScore(score) {
+            if (!score) {
+                return '0%';
+            }
+            return `${Math.round(score * 100)}%`;
+        },
+        formatPyRCAScore(candidate) {
+            const score = candidate?.pyrca_scores?.combined;
+            if (!score) {
+                return '-';
+            }
+            return this.formatScore(score);
+        },
+        candidateEvidence(candidate) {
+            const refs = candidate?.evidence_refs || [];
+            if (!refs.length) {
+                return '-';
+            }
+            const head = refs.slice(0, 4).join(', ');
+            return refs.length > 4 ? `${head}, +${refs.length - 4}` : head;
+        },
+        remediationEvidence(action) {
+            const refs = action?.evidence_refs || [];
+            if (!refs.length) {
+                return '-';
+            }
+            const head = refs.slice(0, 4).join(', ');
+            return refs.length > 4 ? `${head}, +${refs.length - 4}` : head;
+        },
+        remediationRiskColor(risk) {
+            switch (risk) {
+                case 'high':
+                    return 'error';
+                case 'medium':
+                    return 'warning';
+                case 'low':
+                    return 'success';
+                default:
+                    return '';
+            }
         },
         edit(check_id, check_title) {
             this.editing = { active: true, appId: this.incident.application_id, check: { id: check_id, title: check_title } };
@@ -315,6 +573,21 @@ export default {
 }
 .table:deep(tr:hover) {
     background-color: unset !important;
+}
+
+.candidate-table:deep(table) {
+    min-width: 760px;
+}
+.candidate-table .evidence {
+    max-width: 360px;
+    word-break: break-word;
+}
+.trajectory-table:deep(table) {
+    min-width: 620px;
+}
+.remediation-table:deep(table),
+.history-table:deep(table) {
+    min-width: 760px;
 }
 
 .fired {

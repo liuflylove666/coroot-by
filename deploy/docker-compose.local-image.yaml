@@ -1,0 +1,19 @@
+services:
+  coroot:
+    image: coroot-ai-rca-dev:local
+    pull_policy: never
+    environment:
+      - LICENSE_KEY=${LICENSE_KEY:-}
+      - AUTH_ANONYMOUS_ROLE=Admin
+      - AI_RCA_WORKERS=1
+      - AI_RCA_DEMO_SCENARIO=${AI_RCA_DEMO_SCENARIO:-}
+      - DO_NOT_CHECK_FOR_UPDATES=true
+      - DISABLE_USAGE_STATISTICS=true
+    command:
+      - '--data-dir=/data'
+      - '--bootstrap-prometheus-url=http://prometheus:9090'
+      - '--bootstrap-refresh-interval=15s'
+      - '--bootstrap-clickhouse-address=clickhouse:9000'
+      - '--auth-anonymous-role=Admin'
+      - '--do-not-check-for-updates'
+      - '--disable-usage-statistics'
