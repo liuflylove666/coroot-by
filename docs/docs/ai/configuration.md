@@ -11,7 +11,7 @@ AI-powered Root Cause Analysis is available only in Coroot Enterprise (from $1 p
 Coroot Enterprise Edition supports integration with multiple AI model providers:
 
 * Anthropic (Claude Opus 4.6) – recommended, as it delivered the best results based on our tests
-* OpenAI (GPT-5.2)
+* OpenAI (GPT-5.5)
 * Any OpenAI-compatible API, such as DeepSeek or Google Gemini
 
 To set up an integration, go to **Project Settings** → **AI**.
@@ -40,3 +40,5 @@ To configure this, provide your API key, set the base URL of your provider, and 
 Make sure your Coroot Enterprise instance can connect to the specified base URL.
 
 <img alt="OpenAI-compatible API" src="/img/docs/ai/openai_compatible.png" class="w-1200"/>
+
+For local RCA request analysis, you can route this integration through the [AI RCA redacting proxy](./redacting-proxy.md).

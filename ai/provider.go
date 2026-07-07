@@ -33,6 +33,13 @@ type CompletionRequest struct {
 	System    string
 	Prompt    string
 	MaxTokens int
+	Tool      *CompletionTool
+}
+
+type CompletionTool struct {
+	Name        string
+	Description string
+	Parameters  map[string]any
 }
 
 type CompletionResponse struct {
@@ -97,8 +104,30 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 			{"role": "system", "content": req.System},
 			{"role": "user", "content": req.Prompt},
 		},
-		"temperature": 0,
-		"max_tokens":  req.MaxTokens,
+	}
+	if usesCompletionTokens(p.model) {
+		body["max_completion_tokens"] = req.MaxTokens
+	} else {
+		body["max_tokens"] = req.MaxTokens
+		body["temperature"] = 0
+	}
+	if req.Tool != nil {
+		body["tools"] = []map[string]any{
+			{
+				"type": "function",
+				"function": map[string]any{
+					"name":        req.Tool.Name,
+					"description": req.Tool.Description,
+					"parameters":  req.Tool.Parameters,
+				},
+			},
+		}
+		body["tool_choice"] = map[string]any{
+			"type": "function",
+			"function": map[string]string{
+				"name": req.Tool.Name,
+			},
+		}
 	}
 	data, _ := json.Marshal(body)
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, p.baseURL+"/chat/completions", bytes.NewReader(data))
@@ -111,7 +140,14 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 		Model   string `json:"model"`
 		Choices []struct {
 			Message struct {
-				Content string `json:"content"`
+				Content   string `json:"content"`
+				ToolCalls []struct {
+					Type     string `json:"type"`
+					Function struct {
+						Name      string `json:"name"`
+						Arguments string `json:"arguments"`
+					} `json:"function"`
+				} `json:"tool_calls"`
 			} `json:"message"`
 		} `json:"choices"`
 	}
@@ -121,7 +157,18 @@ func (p *openAIProvider) Complete(ctx context.Context, req CompletionRequest) (*
 	if len(out.Choices) == 0 {
 		return nil, errors.New("model returned no choices")
 	}
-	return &CompletionResponse{Text: out.Choices[0].Message.Content, Model: firstNonEmpty(out.Model, p.model)}, nil
+	choice := out.Choices[0]
+	if req.Tool != nil {
+		for _, tc := range choice.Message.ToolCalls {
+			if tc.Type == "function" && tc.Function.Name == req.Tool.Name && strings.TrimSpace(tc.Function.Arguments) != "" {
+				return &CompletionResponse{Text: tc.Function.Arguments, Model: firstNonEmpty(out.Model, p.model)}, nil
+			}
+		}
+	}
+	if strings.TrimSpace(choice.Message.Content) == "" {
+		return nil, errors.New("model returned no content")
+	}
+	return &CompletionResponse{Text: choice.Message.Content, Model: firstNonEmpty(out.Model, p.model)}, nil
 }
 
 type anthropicProvider struct {
@@ -268,4 +315,9 @@ func firstNonEmpty(values ...string) string {
 		}
 	}
 	return ""
+}
+
+func usesCompletionTokens(model string) bool {
+	m := strings.ToLower(model)
+	return strings.HasPrefix(m, "gpt-5") || strings.HasPrefix(m, "o1") || strings.HasPrefix(m, "o3") || strings.HasPrefix(m, "o4")
 }

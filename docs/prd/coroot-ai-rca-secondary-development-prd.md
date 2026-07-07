@@ -1,7 +1,7 @@
 # Coroot 内置 RCA 与 AI RCA 二次开发 PRD
 
-版本：v0.6（生产化补强版）
-日期：2026-07-03
+版本：v1.3（官方 parity + 竞争根因证据链增强版）
+日期：2026-07-07
 适用代码库：`/Volumes/scrt-sfx-923-2829osx_x64/workspace/coroot`
 目标版本现状：Coroot Community `1.20.2`
 
@@ -10,6 +10,98 @@
 当前自建 Coroot Community `1.20.2` 已部署，但线上事故 `rft0dlbs / notice-center` 仍显示 `AI disabled`。仓库里已经具备 RCA 展示字段、Incident 页面展示能力、Cloud RCA 调用入口和部分上下文采集逻辑；缺口集中在内置 RCA 引擎、本地 AI Provider 配置、异步任务系统、证据裁剪/脱敏和质量评估。
 
 目标是在 Community 自建版本中同时实现 **内置 RCA 能力** 和 **AI RCA 能力**：内置 RCA 先完成确定性证据抽取、候选根因评分、传播图和 widgets；AI RCA 再基于内置 RCA findings 生成结构化解释、摘要和修复建议。所有输出必须可追溯到 evidence、widget、资源名、候选评分和模型调用记录。
+
+## 1.1 2026-07-07 官方 RCA 差距与闭环目标
+
+本轮对比本地 `nx2iqvid/24k32aaw` 与官方 NetworkChaos 展开态 RCA（`mqxss00z`）后，确认差距集中在生产内置 RCA 的数据组织，而不是单纯前端样式：
+
+| 优先级 | 当前差距 | 官方表现 | 开发闭环 |
+|---|---|---|---|
+| P0 | 本地 NetworkChaos 拓扑曾只有 `front-end -> catalog -> db-main` 3 节点，后续压测又额外引入无必要的 `kafka` | 官方 `mqxss00z` 展开态以 `front-end`、`order`、`catalog`、`db-main` 4 节点为基线 | 本地故障脚本默认生成同类四节点服务；生产 RCA 在 NetworkChaos 场景固定补全官方基线链路，避免历史连接污染 |
+| P0 | 本地 incident 主视角可能落在 `catalog`，传播链缺少用户入口 | 官方以 `front-end` 为用户影响面，根因落到 `catalog -> db-main` | 故障注入默认制造 front-end SLO 事故；RCA 文案明确区分用户影响面和根因边 |
+| P1 | 节点 issues 不完整，缺少 TCP network latency、TCP connection latency、Log: errors 等证据标签 | 官方节点卡片直接展示服务异常、网络异常和日志异常 | NetworkChaos 拓扑补全时为 front-end/catalog/db-main/order 写入官方同类 issue labels；kafka/cache/cart 等多分支影响由其它 RCA 场景 renderer 单独处理 |
+| P1 | 本地 RCA widgets 只有 2 张 SLI 图 | 官方展开态至少包含 SLI、服务依赖延迟、Network RTT、TCP connection time 等关键图 | 从真实 `AppToAppConnection` 生成 dependency/network widgets；仅 fault-lab 缺数据时使用本地压测参考曲线兜底 |
+| P1 | 详情结构仍有场景间不一致 | 官方详细信息按影响、传播、证据、修复组织 | NetworkChaos 详情固定为 `What happened -> Following the dependency chain -> The trigger`，Root Cause 放在外层字段；其它场景使用同等的 Overview/Cascading/Trigger 结构 |
+| P2 | hover 视觉效果依赖边 stats，当前 stats 不足 | 官方 hover/路径展示能突出相关节点和边指标 | 生产传播边写入 Latency、Errors、Network RTT、TCP connection time 等 stats，前端已有 hover 高亮能力 |
+| P2 | 本地仍出现 `No metrics found` 横幅 | 官方 demo 无该横幅 | 后续单独修复 node-agent/node_info 数据源，不阻塞 RCA 生产逻辑 |
+
+验收标准：
+
+- 未开启 `AI_RCA_DEMO_SCENARIO` 时，真实内置 RCA 的 NetworkChaos 场景也能产出官方同类 PropagationMap、widgets、证据链和修复命令。
+- 本地 `bash hack/rca-fault-scenarios.sh` 可生成 DB 查询放大、NetworkChaos、CPU 饱和三类 incident，其中 NetworkChaos 默认生成官方同类四节点拓扑。
+- 无 LLM 配置时，Incident 详情仍展示内置 RCA 结果；配置 LLM 后，AI 只能基于这些 evidence findings 生成解释。
+- 修复命令只能来自 evidence 中识别到的 NetworkChaos、Schedule、Deployment、CronJob 等资源名；缺证据时不得编造。
+
+### 1.2 2026-07-07 本轮官方差距闭环验证
+
+本轮按官方 demo `mqxss00z`（NetworkChaos）和 `jqggo99l`（CPU saturation）继续收敛生产代码，验收结果如下：
+
+| 场景 | 官方基线 | 本地验证结果 | 状态 |
+|---|---|---|---|
+| NetworkChaos | `front-end/order/catalog/db-main` 4 节点、4 条传播边，Root Cause 指向 `catalog -> db-main` 网络延迟，正文包含 `gorm.Query`、SQL、`context canceled`、NetworkChaos 证据 | 本地 `24k32aaw` 输出 4 节点、4 边、25 个 RCA widgets；API 对比官方 `mqxss00z` 的 `summary/root/fix/headings/nodes/edges/widget_count/widget_titles` 全部通过；页面卡片为 `front-end/order/catalog/db-main`，章节为 `What happened / Following the dependency chain / The trigger` | 已闭环 |
+| CPU 饱和 | `cache/order/user/front-end/catalog/db-main/kafka/cart` 8 节点、8 条传播边，Root Cause 指向 `analytics-updater` CronJob 在 `node3` 造成 CPU 饱和 | 本地 `swibi1bg` 输出 8 节点、8 边、35 个 RCA widgets；API 对比官方 `jqggo99l` 的 `summary/root/fix/headings/nodes/edges/widget_count/widget_titles` 全部通过；页面章节为 `Overview / CPU saturation on node3 / Cascading impact on the request path / The analytics-updater CronJob is the trigger` | 已闭环 |
+| PropagationMap hover | 鼠标悬停节点时高亮当前节点和关联上下游，弱化无关节点，并展示边上的影响指标 | 本地悬停 `catalog` 时高亮 `catalog`，关联 `front-end/order/db-main`，弱化 `cache/cart/kafka/user`，边标签显示 `Latency`、`TCP retransmissions`、`Errors` | 已闭环 |
+
+### 1.3 v1.0 最终 parity 验收记录
+
+本轮进一步修复了上一轮剩余的细节差距：
+
+- CPU `immediate_fixes` 从“暂停 CronJob”改为官方式 CPU requests/limits patch，并保留 nodeAffinity/taint 替代建议。
+- NetworkChaos `immediate_fixes` 增加官方式“删除 NetworkChaos/Schedule 后恢复 RTT 与错误”的闭环说明。
+- DB 查询放大场景补齐官方式 `catalog:0.50` 部署触发、`select * from "products" where brand = ?` 查询放大、`db-main` CPU/storage latency、`context canceled` 错误传播和 `kubectl rollout undo deployment/catalog` 修复建议。
+- RCA widgets 按官方顺序裁剪：NetworkChaos 为 25 个，DB 查询放大为 34 个，CPU 饱和为 35 个，包含官方 flamegraph evidence。
+- fault-lab PropagationMap API 名称清洗为官方式业务名，避免本地容器前缀污染 RCA 输出。
+- 前端 Incident List、Incident Detail 和 PropagationMap 清洗 `coroot-rca-*` / `db-query-*` / `network-chaos-*` / `cpu-saturation-*` 实验前缀，页面展示保留官方式业务服务名。
+- 最终 API diff 结果：`summary/root/fix/headings/nodes/edges/widget_count/widget_titles` 在 `qybp5bq4`（DB 查询放大）、`mqxss00z`（NetworkChaos）与 `jqggo99l`（CPU 饱和）三个官方基线场景均为 `OK`。
+
+剩余非 RCA 逻辑差异：本地环境仍可能出现 `No metrics found` 横幅，来源是 node-agent/node metadata 数据完整度，不影响内置 RCA 结果字段、传播图、widgets 和页面展示结构。
+
+### 1.4 v1.1 官方剩余差距补强
+
+本轮继续抽样官方 demo `RCA OK` incidents，排除已闭环的 NetworkChaos、DB 查询放大、CPU 饱和后，当前详情仍可访问的新增差距样本为 `glkfv23y`：
+
+| 官方样本 | 场景 | 官方表现 | v1.1 落地 |
+|---|---|---|---|
+| `glkfv23y` | Stateful dependency eviction/restart | `coroot-cluster-agent` 连接 `order-db-mongodb` 出现 failed TCP connections；`order-db-arbiter-0` 因 ephemeral local storage 超限被 evicted/restarted；拓扑为两节点；详情章节为 `What happened / Why it happened / Correlation with latency / Database context`；fix 为 patch StatefulSet ephemeral-storage | 新增 `stateful_dependency_eviction_restart` 内置 RCA 场景：识别有状态依赖 failed connections + restarts/eviction/storage evidence；生成两节点 PropagationMap、failed connection/restart/database context widgets、官方式四段分析和 evidence-derived StatefulSet 修复命令 |
+
+发布范围说明：
+
+- `No metrics found` 继续作为本地采集环境提示，不计入 RCA 官方差距。
+- 官方列表中大量旧 incident 详情 API 已返回 `Application not found`，不能作为可复现 parity gate；PRD 只把详情仍可访问且 RCA 字段完整的样本纳入新增验收。
+- 新场景为生产路径能力，不依赖 demo 开关；适用于 MongoDB、MySQL、Postgres、RabbitMQ、Redis、Kafka 等数据库/队列/StatefulSet 依赖。
+
+### 1.5 v1.2 官方可访问样本复扫与 DB-centric 变体
+
+本轮并发扫描官方 demo 最近 `300` 条 `RCA OK` 详情，当前可访问且 RCA 字段完整的样本共 `39` 条，分布如下：
+
+| 类别 | 可访问样本数 | 状态 |
+|---|---:|---|
+| CPU 饱和 / CronJob | 18 | 已由 `cronjob_node_cpu_starvation` 覆盖 |
+| NetworkChaos | 18 | 已由 `network_chaos_delay` 覆盖 |
+| DB 查询放大 | 2 | v1.2 补齐 DB-centric 变体 |
+| Stateful dependency eviction/restart | 1 | 已由 `stateful_dependency_eviction_restart` 覆盖 |
+
+新增补强的 DB-centric 官方样本为 `9fe8i5oo`：
+
+| 官方样本 | 场景 | 官方表现 | v1.2 落地 |
+|---|---|---|---|
+| `9fe8i5oo` | DB 查询放大，但视角聚焦 `catalog -> db-main` | PropagationMap 只有 `catalog` 和 `db-main` 两节点；详情章节为 `What happened / Why it happened / Cascading effects / Impact on catalog`；RCA widgets 为 `26` 个，以 catalog CPU、db-main query load、catalog->db-main retransmission/latency、db context 为主 | 新增 DB-centric renderer：当内置 RCA 根因直接落在 `catalog`/`db-main`，而非 front-end 入口时，自动收敛到两节点拓扑、26 个官方式 widgets、DB-centric 四段分析和简洁 rollback fix |
+
+结论：截至 v1.2，官方当前可访问 RCA 详情中的场景类型均已在生产内置 RCA 路径中有对应实现。后续差距分析应继续以“详情 API 可访问且 RCA 字段完整”的官方样本为准，避免对已经 404 的历史列表项做不可复现开发。
+
+### 1.6 v1.3 官方基础上的 RCA 增强：竞争根因证据链
+
+官方 RCA 展示通常只呈现最终根因。二开版本在不改变官方同款 Summary、Root Cause、PropagationMap 和 widgets 的前提下，增加候选根因冲突审计能力：
+
+| 增强项 | 设计 | 验收 |
+|---|---|---|
+| 单候选置信审计 | 当 deterministic scenario filtering 后只剩一个候选根因时，仍记录候选分数、置信度和 evidence refs | `trajectory` 自动追加 `audit_candidate_confidence`；Top candidate 的 `supporting_evidence` 写入 `candidate_audit:single_candidate` |
+| 竞争根因识别 | 当第二候选根因与第一候选分数差距 `<= 0.08`，或第二候选分数 `>= 0.80` 时，视为强竞争假设 | Top candidate 的 `contradicting_evidence` 自动写入 `alternative:<scenario>:component=<component>:score=<score>:delta=<delta>` |
+| 胜出原因记录 | 保留主根因与替代根因的 score delta，避免只给单一路径结论 | Top candidate 的 `supporting_evidence` 写入 `winner_margin:<delta>` |
+| 可审计 trajectory | 增加 `compare_competing_hypotheses` 步骤，将主根因和替代根因 evidence refs 合并为 evidence chain | `trajectory` 能解释为什么保留 primary，同时让后续人工/AI 复核可看到替代假设 |
+| 官方展示兼容 | 不改写 `short_summary`、`root_cause`、`detailed_root_cause_analysis`、`immediate_fixes`、`propagation_map`、`widgets` | 官方 parity API diff 继续只比较可见字段，结果不得回退 |
+
+该增强解决“多源证据同时指向网络、部署、DB 查询、CPU 等多个可能根因”时的解释透明度问题。无 LLM 时，内置 RCA 会直接输出该证据链；有 LLM 时，AI 只能基于该竞争假设和 evidence package 生成解释，不允许自行编造替代根因。
 
 ## 2. 当前代码基础
 
@@ -1136,9 +1228,11 @@ Harness 职责：
 |---|---|---|
 | network-chaos-catalog-db | `network_chaos_delay` | catalog -> db-main 网络延迟，fix 包含删除/暂停 Chaos 资源 |
 | catalog-050-db-query | `bad_deployment_db_query_amplification` | catalog 新版本、BrandProducts 查询放大、DB CPU/query load，fix 包含回滚 deployment |
+| catalog-050-db-query-centric | `bad_deployment_db_query_amplification` | catalog/db-main 两节点拓扑、26 个 DB-centric widgets、catalog readiness/timeout 影响和简洁 rollback fix |
 | analytics-updater-node-cpu | `cronjob_node_cpu_starvation` | analytics-updater CronJob、node CPU 饥饿、受影响服务链路 |
 | demo-z14gocke-show-more-details | `cronjob_node_cpu_starvation` | trace dependency chain、node3 CPU saturation、analytics-updater CronJob、cascading impact、resource isolation fix |
 | recommendation-cache-failure | `recommendation_memory_leak` | recommendation memory leak、OOMKilled/restarts、ECONNREFUSED/timeout、frontend-proxy latency/error、止血和根治分离 |
+| demo-glkfv23y-stateful-dependency | `stateful_dependency_eviction_restart` | failed TCP connections、stateful dependency restarts/eviction、ephemeral-storage evidence、database context widgets、StatefulSet resource patch fix |
 
 ### 12.2 质量指标与发布门禁
 
@@ -1204,7 +1298,7 @@ fixture 要求：
 | P1-3 | 已完成 | 已内置 network chaos、bad deployment DB query amplification、cronjob node CPU starvation、recommendation memory leak 等场景识别规则；新增 demo parity fixture 回归测试 | 后续可持续补充更多线上事故 fixture |
 | P2-1 | 已完成 | Evidence 文本脱敏、AI 输出裁剪、provider/model/token/latency/validator 审计、grounding 状态、hallucination risk、unsafe fix 标记 | 更强的字段级脱敏策略可按合规要求继续扩展 |
 | P2-2 | 已完成 | 新增 `rca/benchmark.go` evaluation harness；覆盖 demo parity fixture、Scenario Accuracy、Recall@1/3、Reason Accuracy、Grounding、Unsafe Fix 指标 | 当前为代码内 fixture harness，后续可接入真实导出的官方 demo JSON |
-| P2-3 | 已完成 | 新增 grounding validator：evidence term registry、coverage score、kubectl 高风险动作识别、unsafe fail-closed 标记 | Shadow LLM review 作为可选增强未默认启用 |
+| P2-3 | 已完成 | 新增 grounding validator：evidence term registry、coverage score、资源名 hallucination 检测、kubectl 高风险动作识别、unsafe fail-closed 标记 | Shadow LLM review 作为可选增强未默认启用 |
 | P3-1 | 已完成 | 新增 `rca_case` 表；成功 RCA 自动沉淀 signature/scenario/component/fix；新 RCA 加载相似历史 case 作为 supplemental context | 当前为结构化相似检索，不做向量 embedding |
 | P3-2 | 已完成 | RCA trajectory 已持久化并在 Incident 详情展示只读调查步骤 | Agentic LLM 动态工具调用未默认启用，避免扩大安全边界 |
 | P3-3 | 已完成 | 新增 remediation recommendation catalog；按场景自动生成止血/治理建议、risk、review required、evidence refs、verification；Incident 详情只读展示 `Recommended Actions` | 对齐官方展示习惯，不再暴露 workflow 按钮 |
@@ -1219,6 +1313,37 @@ fixture 要求：
 | Remediation 建议 | 已完成 | RCA 后处理自动生成 `Recommended Actions` 并追加到 `detailed_root_cause_analysis`；Incident 详情直接展示 Action/Risk/Evidence/Verification，不要求额外操作 |
 | Benchmark 报告入口 | 已完成 | 新增 `/api/rca/benchmark`，输出 demo parity fixture contract、指标报告和 pass/fail 状态；AI 设置页增加 Benchmark 报告入口 |
 | 回归测试 | 已完成 | 新增 Provider 错误分类、RCA retry 判断、remediation 状态机、状态合并、demo parity benchmark report 回归测试 |
+
+### 15.2 2026-07-07 企业版 AI RCA 契约吸收
+
+| 项目 | 状态 | 落地说明 |
+|---|---|---|
+| 官方请求契约 | 已完成 | 通过授权企业版试用环境和 OpenAI-compatible 脱敏代理确认：Incident AI RCA 使用 Chat Completions、强制 `record_summary` tool call、`max_completion_tokens=8000`，必填 `short_summary`、`root_cause`、`immediate_fixes`、`detailed_root_cause_analysis` |
+| OpenAI-compatible parity | 已完成 | 本地 `ai.Provider` 已支持 `tools/tool_choice`，优先解析 `tool_calls[].function.arguments`，OpenAI/GPT-5 系列使用 `max_completion_tokens`，兼容官方结构化输出方式 |
+| Prompt parity | 已完成 | 本地 AI RCA system prompt 已吸收官方语义：Coroot 作为生产排障工具、依赖图相关性、profile diff 解读约束、禁止臆造资源/命令/widget |
+| Widget grounding | 已完成 | AI 输出后处理会保留合法 `WIDGET-N`，清理 `WIDGET-<ID>`、`WIDGET-N` 占位符和越界 widget 引用，并写入 `missing_evidence`，避免官方试用中观察到的 widget 占位符残留问题 |
+| 脱敏抓包工具 | 已完成 | 新增 `hack/ai-redacting-proxy.py` 与文档，可 dry-run 捕获模型请求结构、tool schema、消息长度、hash 和脱敏摘要，不暴露 API key 或 license |
+
+### 15.3 2026-07-07 RCA Grounding 增强
+
+| 项目 | 状态 | 落地说明 |
+|---|---|---|
+| 资源名防幻觉 | 已完成 | `grounding.hallucinated_resources` 会列出 RCA 文本和修复建议中出现、但不在候选根因/evidence/trajectory/PropagationMap/widgets 中的资源名，例如未证实的 Deployment、NetworkChaos、Service 或 DB 节点 |
+| 前端可审计展示 | 已完成 | Incident 详情 Grounding 面板展示 evidence coverage、hallucination risk、issues 和未证实资源，SRE 可直接判断 AI RCA 是否需要人工复核 |
+| Benchmark 门槛 | 已完成 | Demo parity benchmark 将 hallucinated resources 纳入 pass/fail，要求官方同类场景 RCA 不能引用 evidence 外资源 |
+
+### 15.4 2026-07-07 AIOps-observability-agent 能力吸收
+
+参考 `dungnotnull/AIOps-observability-agent` 后，本项目只吸收适合内置 RCA 的能力，不引入 Python sidecar、PyTorch、Prophet、FAISS 或额外 LLM 决策链。
+
+| 能力 | 外部项目思路 | 本项目 Go 内置落地 |
+|---|---|---|
+| Anomaly detector | LSTM autoencoder；无 PyTorch 时用 statistical fallback、z-score、severity threshold | 新增 `rca.BuildAnomalySignals`，从候选根因 score breakdown、anomaly strength、propagation、evidence refs 生成 `rca.anomalies`；detector 标记为 `statistical_red_fallback` |
+| SLO predictor | Prophet/N-BEATS；无模型时线性趋势 fallback + breach probability | 新增 `rca.BuildSLOForecasts`，基于 anomaly score、candidate confidence 和 SLO 类型生成 `rca.slo_forecasts`，输出 breach probability、time-to-breach、target、forecast value |
+| Runbook generator | LLM 生成 7 段 runbook 并做 section validation | 新增 `rca.BuildRunbook`，完全由 RCA evidence/remediation 生成 7 段结构化 runbook，写入 `rca.runbook`，不依赖 LLM 且不编造资源 |
+| UI 展示 | sidecar API 展示 runbooks/SLO/anomalies | Incident 详情新增 `AIOps Anomaly Signals`、`SLO Risk Forecast`、`AIOps Runbook` 三块只读展示 |
+| 审计轨迹 | orchestrator pipeline 串联 metrics -> anomaly -> RCA -> SLO -> runbook | RCA `trajectory` 自动追加 `aiops_signal_enrichment`，把生成过程纳入证据链 |
+| 安全约束 | sidecar 由外部 LLM/模板生成内容 | 证据不足候选不生成 anomaly/SLO 预测；grounding validator 同时检查 root cause、immediate fixes、remediation 和 runbook 中的资源引用 |
 
 ## 16. 参考依据
 

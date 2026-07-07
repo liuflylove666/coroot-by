@@ -7,11 +7,18 @@
         <div class="applications" v-on-resize="calc" @scroll="calc" @mousemove="syncHover" @mouseleave="clearHover">
             <div v-for="apps in levels" class="level" style="z-index: 1; row-gap: 20px">
                 <div v-for="a in apps" style="text-align: center">
-                    <div :ref="a.id" class="app" :data-app-id="a.id" @mouseenter="setHover(a.id)" @mouseleave="clearHover">
+                    <div
+                        :ref="a.id"
+                        class="app"
+                        :class="{ selected: hi === a.id, related: hi && hi !== a.id && a.hi(hi), dimmed: hi && !a.hi(hi) }"
+                        :data-app-id="a.id"
+                        @mouseenter="setHover(a.id)"
+                        @mouseleave="clearHover"
+                    >
                         <div class="d-flex align-center">
                             <div class="flex-grow-1 name">
                                 <router-link :to="{ name: 'overview', params: { view: 'applications', id: a.id }, query: $utils.contextQuery() }">
-                                    {{ $utils.appId(a.id).name }}
+                                    {{ displayAppName(a.id) }}
                                 </router-link>
                             </div>
                             <AppIcon :icon="a.icon" class="ml-1" />
@@ -44,12 +51,17 @@
                 </defs>
 
                 <template v-for="a in arrows">
-                    <path v-if="a.dd" :d="a.dd" class="arrow" :class="a.status" />
-                    <path :d="a.d" class="arrow" :class="a.status" :stroke-opacity="0.7" :marker-end="`url(#marker-${a.status})`" />
+                    <path v-if="a.dd" :d="a.dd" class="arrow" :class="[a.status, { selected: hi && a.hi(hi), dimmed: hi && !a.hi(hi) }]" />
+                    <path
+                        :d="a.d"
+                        class="arrow"
+                        :class="[a.status, { selected: hi && a.hi(hi), dimmed: hi && !a.hi(hi) }]"
+                        :marker-end="`url(#marker-${a.status})`"
+                    />
                 </template>
             </svg>
             <template v-for="a in arrows">
-                <div v-if="a.stats && hi" class="stats" :style="{ top: a.stats.y + 'px', left: a.stats.x + 'px', zIndex: 3 }">
+                <div v-if="a.stats && hi && a.hi(hi)" class="stats" :style="{ top: a.stats.y + 'px', left: a.stats.x + 'px', zIndex: 3 }">
                     <div v-for="i in a.stats.items">{{ i }}</div>
                 </div>
             </template>
@@ -161,7 +173,7 @@ export default {
                 return;
             }
             applications.forEach((a) => {
-                a.name = this.$utils.appId(a.id).name;
+                a.name = this.displayAppName(a.id);
                 a.levels = [];
                 a.upstreams = a.upstreams.filter(filter);
                 a.upstreams.sort((u1, u2) => u1.id.localeCompare(u2.id));
@@ -224,6 +236,7 @@ export default {
                         src: app.id,
                         dst: u.id,
                         status: u.status,
+                        hi: (hi) => app.id === hi || u.id === hi,
                     };
                     const s = getRect(a.src);
                     const d = getRect(a.dst);
@@ -277,6 +290,9 @@ export default {
         clearHover() {
             this.setHover(null);
         },
+        displayAppName(id) {
+            return this.$utils.rcaAppName(id);
+        },
     },
 };
 </script>
@@ -315,6 +331,13 @@ export default {
 .app.selected {
     border: 1px solid var(--text-color);
     background-color: var(--background-color-hi);
+    box-shadow: 0 0 0 2px rgba(33, 150, 243, 0.18);
+}
+.app.related {
+    border-color: var(--text-color);
+}
+.app.dimmed {
+    opacity: 0.35;
 }
 .name {
     white-space: nowrap;
@@ -356,6 +379,13 @@ svg {
 .arrow.critical {
     stroke: var(--status-critical);
     stroke-width: 1.5;
+}
+.arrow.selected {
+    stroke-width: 2.4;
+    opacity: 1;
+}
+.arrow.dimmed {
+    opacity: 0.18;
 }
 .marker.unknown {
     fill: var(--status-unknown);

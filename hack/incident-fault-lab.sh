@@ -4,6 +4,7 @@ set -Eeuo pipefail
 ACTION="${1:-run}"
 
 COROOT_URL="${COROOT_URL:-http://127.0.0.1:8080}"
+COROOT_COOKIE_FILE="${COROOT_COOKIE_FILE:-/tmp/coroot-ee.cookie}"
 PROJECT_ID="${PROJECT_ID:-}"
 NETWORK="${NETWORK:-coroot_default}"
 IMAGE="${IMAGE:-python:3.12-alpine}"
@@ -67,7 +68,11 @@ ensure_tools() {
 }
 
 curl_json() {
-  curl -fsS "$1"
+  if [[ -f "$COROOT_COOKIE_FILE" ]]; then
+    curl -fsS -b "$COROOT_COOKIE_FILE" "$1"
+  else
+    curl -fsS "$1"
+  fi
 }
 
 detect_project_id() {
@@ -86,7 +91,7 @@ print(projects[0]["id"], end="")
 }
 
 ensure_coroot() {
-  curl -fsS "$COROOT_URL/api/user" >/dev/null
+  curl_json "$COROOT_URL/api/user" >/dev/null
 }
 
 ensure_network() {

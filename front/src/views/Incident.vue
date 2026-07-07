@@ -43,7 +43,7 @@
                             :to="{ name: 'overview', params: { view: 'applications', id: incident.application_id }, query: $utils.contextQuery() }"
                             class="name"
                         >
-                            {{ $utils.appId(incident.application_id).name }}
+                            {{ $utils.rcaAppName(incident.application_id) }}
                         </router-link>
                     </div>
 
@@ -211,6 +211,7 @@
                                     <div class="mt-5 mb-2 text-subtitle-1">RCA Audit</div>
                                     <v-chip v-for="a in rcaAudit" :key="a" small outlined class="mr-2 mb-2">{{ a }}</v-chip>
                                 </template>
+                                </div>
 
                                 <template v-if="grounding">
                                     <div class="mt-5 mb-2 text-subtitle-1">Grounding</div>
@@ -218,9 +219,94 @@
                                         {{ grounding.status }} / risk: {{ grounding.hallucination_risk }}
                                     </v-chip>
                                     <v-chip small outlined class="mr-2 mb-2">evidence coverage: {{ formatScore(grounding.evidence_coverage) }}</v-chip>
+                                    <template v-if="grounding.hallucinated_resources && grounding.hallucinated_resources.length">
+                                        <div class="caption warning--text text--darken-2 mt-2 mb-1">Resources not present in evidence</div>
+                                        <v-chip
+                                            v-for="resource in grounding.hallucinated_resources"
+                                            :key="resource"
+                                            x-small
+                                            outlined
+                                            color="warning"
+                                            class="mr-2 mb-2"
+                                        >
+                                            {{ resource }}
+                                        </v-chip>
+                                    </template>
                                     <v-alert v-if="grounding.issues && grounding.issues.length" dense outlined type="warning" class="mt-2">
                                         <div v-for="issue in grounding.issues" :key="issue">{{ issue }}</div>
                                     </v-alert>
+                                </template>
+
+                                <template v-if="anomalies.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">AIOps Anomaly Signals</div>
+                                    <v-simple-table dense class="aiops-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Service</th>
+                                                <th>Metric</th>
+                                                <th>Score</th>
+                                                <th>Severity</th>
+                                                <th>Detector</th>
+                                                <th>Evidence</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="a in anomalies" :key="`${a.component || a.service}:${a.metric}`">
+                                                <td class="text-no-wrap">{{ a.service }}</td>
+                                                <td>{{ a.metric }}</td>
+                                                <td>{{ a.anomaly_score }}</td>
+                                                <td><v-chip x-small outlined :color="aiopsSeverityColor(a.severity)">{{ a.severity }}</v-chip></td>
+                                                <td>{{ a.detector }}</td>
+                                                <td class="evidence">{{ rcaEvidenceRefs(a) }}</td>
+                                            </tr>
+                                        </tbody>
+                                    </v-simple-table>
+                                </template>
+
+                                <template v-if="sloForecasts.length">
+                                    <div class="mt-5 mb-2 text-subtitle-1">SLO Risk Forecast</div>
+                                    <v-simple-table dense class="aiops-table">
+                                        <thead>
+                                            <tr>
+                                                <th>Service</th>
+                                                <th>SLI</th>
+                                                <th>Risk</th>
+                                                <th>Time to breach</th>
+                                                <th>Target</th>
+                                                <th>Forecast</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            <tr v-for="f in sloForecasts" :key="`${f.service}:${f.sli}`">
+                                                <td class="text-no-wrap">{{ f.service }}</td>
+                                                <td>{{ f.sli }}</td>
+                                                <td>
+                                                    <v-chip x-small outlined :color="f.is_at_risk ? 'warning' : 'success'">
+                                                        {{ formatScore(f.breach_probability) }}
+                                                    </v-chip>
+                                                </td>
+                                                <td>{{ f.time_to_breach_minutes ? `${f.time_to_breach_minutes}m` : '-' }}</td>
+                                                <td>{{ f.direction }} {{ f.target }}</td>
+                                                <td>{{ formatForecastValue(f.forecast_value_at_horizon) }}</td>
+                                            </tr>
+                                        </tbody>
+                                    </v-simple-table>
+                                </template>
+
+                                <template v-if="runbook">
+                                    <div class="mt-5 mb-2 text-subtitle-1">AIOps Runbook</div>
+                                    <v-chip small outlined class="mr-2 mb-2" :color="aiopsSeverityColor(runbook.severity)">{{ runbook.severity }}</v-chip>
+                                    <v-chip small outlined class="mr-2 mb-2" :color="runbook.sections_complete ? 'success' : 'warning'">
+                                        {{ runbook.sections_complete ? 'complete' : 'incomplete' }}
+                                    </v-chip>
+                                    <v-simple-table dense class="runbook-table">
+                                        <tbody>
+                                            <tr v-for="section in runbookSections" :key="section.title">
+                                                <th>{{ section.title }}</th>
+                                                <td class="runbook-text">{{ section.text || '-' }}</td>
+                                            </tr>
+                                        </tbody>
+                                    </v-simple-table>
                                 </template>
 
                                 <template v-if="remediation.length">
@@ -302,7 +388,6 @@
                                         </tbody>
                                     </v-simple-table>
                                 </template>
-                                </div>
                             </v-card>
                         </template>
                     </template>
@@ -414,6 +499,27 @@ export default {
                 default:
                     return 'warning';
             }
+        },
+        anomalies() {
+            return this.incident?.rca?.anomalies || [];
+        },
+        sloForecasts() {
+            return this.incident?.rca?.slo_forecasts || [];
+        },
+        runbook() {
+            return this.incident?.rca?.runbook || null;
+        },
+        runbookSections() {
+            const r = this.runbook || {};
+            return [
+                { title: 'Summary', text: r.summary },
+                { title: 'Impact Assessment', text: r.impact_assessment },
+                { title: 'Detection & Timeline', text: r.detection_timeline },
+                { title: 'Diagnosis Steps', text: r.diagnosis_steps },
+                { title: 'Remediation Steps', text: r.remediation_steps },
+                { title: 'Escalation Path', text: r.escalation_path },
+                { title: 'Follow-Up Actions', text: r.follow_up_actions },
+            ];
         },
         remediation() {
             return this.incident?.rca?.remediation || [];
@@ -551,6 +657,33 @@ export default {
             const head = refs.slice(0, 4).join(', ');
             return refs.length > 4 ? `${head}, +${refs.length - 4}` : head;
         },
+        rcaEvidenceRefs(item) {
+            const refs = item?.evidence_refs || [];
+            if (!refs.length) {
+                return '-';
+            }
+            const head = refs.slice(0, 4).join(', ');
+            return refs.length > 4 ? `${head}, +${refs.length - 4}` : head;
+        },
+        formatForecastValue(value) {
+            return value === undefined || value === null || value === '' ? '-' : value;
+        },
+        aiopsSeverityColor(severity) {
+            if (!severity) {
+                return '';
+            }
+            const s = severity.toLowerCase();
+            if (s.includes('critical') || s.includes('p1')) {
+                return 'error';
+            }
+            if (s.includes('high') || s.includes('p2')) {
+                return 'warning';
+            }
+            if (s.includes('medium') || s.includes('p3')) {
+                return 'primary';
+            }
+            return 'success';
+        },
         remediationRiskColor(risk) {
             switch (risk) {
                 case 'high':
@@ -606,6 +739,23 @@ export default {
 }
 .trajectory-table:deep(table) {
     min-width: 620px;
+}
+.aiops-table:deep(table) {
+    min-width: 760px;
+}
+.aiops-table .evidence {
+    max-width: 360px;
+    word-break: break-word;
+}
+.runbook-table:deep(table) {
+    min-width: 760px;
+}
+.runbook-table th {
+    width: 190px;
+    vertical-align: top;
+}
+.runbook-text {
+    white-space: pre-line;
 }
 .remediation-table:deep(table),
 .history-table:deep(table) {

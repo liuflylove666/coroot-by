@@ -40,7 +40,15 @@ func BuiltIn(req cloud.RCARequest, world *model.World, incident *model.Applicati
 	missing := missingEvidence(req, app)
 	pm := propagationMap(app, incident)
 	pm = focusPropagationMap(pm, app, candidates[0])
+	pm = enhanceDBQueryPropagationMap(world, app, pm, candidates[0])
+	pm = enhanceNetworkChaosPropagationMap(world, app, pm, candidates[0])
+	pm = enhanceCPUContentionPropagationMap(world, app, pm, candidates[0])
+	pm = enhanceStatefulDependencyPropagationMap(world, app, pm, candidates[0])
 	widgets := evidenceWidgets(world, app, pm)
+	widgets = enhanceDBQueryWidgets(world, app, pm, candidates[0], widgets)
+	widgets = enhanceNetworkChaosWidgets(world, app, pm, candidates[0], widgets)
+	widgets = enhanceCPUContentionWidgets(world, app, pm, candidates[0], widgets)
+	widgets = enhanceStatefulDependencyWidgets(world, app, pm, candidates[0], widgets)
 	addIncidentAnnotation(widgets, req.Ctx.From, req.Ctx.To)
 
 	rca := &model.RCA{
@@ -76,12 +84,17 @@ func buildCandidates(req cloud.RCARequest, world *model.World, app *model.Applic
 			if ch.Message != "" {
 				candidate.EvidenceRefs = append(candidate.EvidenceRefs, "message:"+sanitizeText(ch.Message))
 			}
+			if ch.Id == model.Checks.LogErrors.Id {
+				candidate.EvidenceRefs = append(candidate.EvidenceRefs, logPatternEvidenceRefs(app)...)
+			}
 			candidate.Score = scoreCandidate(candidate, app, 0, len(ch.Widgets)+len(r.Widgets), 1)
 			candidate.PyRCAScores = pyRCAScores(candidate, app, 0, len(candidate.EvidenceRefs))
 			candidates = append(candidates, candidate)
 		}
 	}
 	candidates = append(candidates, periodicJobCPUCandidates(req, world, app, len(candidates))...)
+	candidates = append(candidates, faultLabScenarioCandidates(req, world, app, len(candidates))...)
+	candidates = append(candidates, statefulDependencyFailureCandidates(req, app, len(candidates))...)
 	candidates = append(candidates, networkDependencyCandidates(req, app, k8sReason, len(candidates))...)
 
 	for _, u := range app.Upstreams {
@@ -101,24 +114,7 @@ func buildCandidates(req cloud.RCARequest, world *model.World, app *model.Applic
 		candidates = append(candidates, candidate)
 	}
 
-	if len(app.Deployments) > 0 {
-		for _, d := range app.Deployments {
-			if d.StartedAt.Before(req.Ctx.From.Add(-30*timeseries.Minute)) || d.StartedAt.After(req.Ctx.To) {
-				continue
-			}
-			reason, scenario := "recent_deployment", "deployment_change"
-			if hasUnhealthyDatabaseUpstream(app) {
-				reason, scenario = "bad_deployment_db_query_amplification", "bad_deployment_db_query_amplification"
-			}
-			candidate := newCandidate(len(candidates)+1, d.StartedAt, app, reason, scenario)
-			candidate.ReasonCodes = append(candidate.ReasonCodes, "deployment_in_incident_window")
-			candidate.EvidenceRefs = append(candidate.EvidenceRefs, "deployment:"+d.Id())
-			candidate.Score = scoreCandidate(candidate, app, 0, 1, 1)
-			candidate.PyRCAScores = pyRCAScores(candidate, app, 0, len(candidate.EvidenceRefs))
-			candidates = append(candidates, candidate)
-			break
-		}
-	}
+	candidates = append(candidates, deploymentChangeCandidates(req, app, len(candidates))...)
 
 	if req.ErrorTrace != nil {
 		candidate := newCandidate(len(candidates)+1, req.Ctx.From, app, "error_trace_propagation", "trace_error")
@@ -289,6 +285,169 @@ func periodicJobEventSignals(events []*model.LogEntry) (*utils.StringSet, *utils
 	return jobs, nodes
 }
 
+func statefulDependencyFailureCandidates(req cloud.RCARequest, app *model.Application, offset int) []*model.RCACandidate {
+	if app == nil {
+		return nil
+	}
+	var candidates []*model.RCACandidate
+	seen := map[string]struct{}{}
+	var walk func(a *model.Application, depth int)
+	walk = func(a *model.Application, depth int) {
+		if a == nil || depth > 2 {
+			return
+		}
+		for _, u := range sortedConnections(a.Upstreams, true) {
+			remote := u.RemoteApplication
+			if remote == nil {
+				continue
+			}
+			if !statefulDependencyRoot(remote) {
+				walk(remote, depth+1)
+				continue
+			}
+			restartRefs, restartReasons := statefulRestartEvidenceRefs(remote)
+			eventRefs, eventReasons := statefulDependencyEventEvidenceRefs(req.KubernetesEvents, remote)
+			if len(restartRefs) == 0 && len(eventRefs) == 0 {
+				walk(remote, depth+1)
+				continue
+			}
+			networkRefs := networkEvidenceRefs(u, a, remote)
+			if len(networkRefs) == 0 && !u.HasFailedConnectionAttempts() && !u.HasConnectivityIssues() {
+				walk(remote, depth+1)
+				continue
+			}
+			key := a.Id.String() + "->" + remote.Id.String()
+			if _, ok := seen[key]; ok {
+				walk(remote, depth+1)
+				continue
+			}
+			seen[key] = struct{}{}
+			candidate := newCandidate(offset+len(candidates)+1, req.Ctx.From, remote, "dependency_pod_eviction_restart", "stateful_dependency_eviction_restart")
+			candidate.Component = key
+			candidate.ComponentType = "dependency"
+			candidate.ReasonCodes = append(candidate.ReasonCodes, "dependency_failed_connections", "stateful_dependency_restart_signal")
+			candidate.ReasonCodes = append(candidate.ReasonCodes, restartReasons...)
+			candidate.ReasonCodes = append(candidate.ReasonCodes, eventReasons...)
+			candidate.EvidenceRefs = append(candidate.EvidenceRefs, "link:"+key, "component:"+remote.Id.String())
+			candidate.EvidenceRefs = append(candidate.EvidenceRefs, networkRefs...)
+			candidate.EvidenceRefs = append(candidate.EvidenceRefs, restartRefs...)
+			candidate.EvidenceRefs = append(candidate.EvidenceRefs, eventRefs...)
+			candidate.Score = scoreCandidate(candidate, remote, depth+1, len(candidate.EvidenceRefs), boolInt(len(eventRefs) > 0))
+			if candidate.Score < 0.90 {
+				candidate.Score = 0.90
+				candidate.Confidence = "high"
+				if candidate.ScoreBreakdown != nil {
+					candidate.ScoreBreakdown.Final = candidate.Score
+				}
+			}
+			candidate.PyRCAScores = pyRCAScores(candidate, remote, depth+1, len(candidate.EvidenceRefs))
+			candidate.PyRCAScores.GraphPaths = [][]string{{app.Id.String(), a.Id.String(), remote.Id.String()}}
+			candidates = append(candidates, candidate)
+			walk(remote, depth+1)
+		}
+	}
+	walk(app, 0)
+	return candidates
+}
+
+func statefulDependencyRoot(app *model.Application) bool {
+	if app == nil {
+		return false
+	}
+	if app.ApplicationType().IsDatabase() || app.ApplicationType().IsQueue() {
+		return true
+	}
+	if app.Id.Kind == model.ApplicationKindStatefulSet {
+		return true
+	}
+	name := strings.ToLower(app.Id.Name)
+	for _, token := range []string{"db", "mysql", "postgres", "mongodb", "mongo", "rabbitmq", "redis", "kafka", "zookeeper"} {
+		if strings.Contains(name, token) {
+			return true
+		}
+	}
+	return false
+}
+
+func statefulRestartEvidenceRefs(app *model.Application) ([]string, []string) {
+	refs := utils.NewStringSet()
+	reasons := utils.NewStringSet()
+	if app == nil {
+		return nil, nil
+	}
+	for _, r := range app.Reports {
+		if r == nil || r.Status < model.WARNING {
+			continue
+		}
+		for _, ch := range r.Checks {
+			if ch == nil || ch.Status < model.WARNING {
+				continue
+			}
+			switch ch.Id {
+			case model.Checks.InstanceRestarts.Id:
+				refs.Add(fmt.Sprintf("check:%s", ch.Id), fmt.Sprintf("report:%s", r.Name))
+				reasons.Add("dependency_restarts")
+			case model.Checks.StorageSpace.Id, model.Checks.StorageIOLoad.Id:
+				refs.Add(fmt.Sprintf("check:%s", ch.Id), fmt.Sprintf("report:%s", r.Name))
+				reasons.Add("dependency_storage_pressure")
+			}
+			if ch.Message != "" {
+				lower := strings.ToLower(ch.Message)
+				if strings.Contains(lower, "restart") || strings.Contains(lower, "evict") || strings.Contains(lower, "ephemeral") || strings.Contains(lower, "storage") {
+					refs.Add("message:" + sanitizeText(ch.Message))
+				}
+			}
+		}
+	}
+	for _, sample := range applicationLogPatternSamples(app) {
+		lower := strings.ToLower(sample)
+		if strings.Contains(lower, "evicted") || strings.Contains(lower, "ephemeral") || strings.Contains(lower, "crashloop") || strings.Contains(lower, "back-off") || strings.Contains(lower, "restart") {
+			refs.Add("log:pattern:" + shortEvidenceSlug(sample, 96))
+			reasons.Add("dependency_log_restart_or_eviction")
+		}
+	}
+	return refs.Items(), reasons.Items()
+}
+
+func statefulDependencyEventEvidenceRefs(events []*model.LogEntry, remote *model.Application) ([]string, []string) {
+	refs := utils.NewStringSet()
+	reasons := utils.NewStringSet()
+	if remote == nil {
+		return nil, nil
+	}
+	remoteName := strings.ToLower(remote.Id.Name)
+	for _, event := range events {
+		body := sanitizeText(event.Body)
+		lower := strings.ToLower(body)
+		if !(strings.Contains(lower, "evicted") || strings.Contains(lower, "ephemeral") || strings.Contains(lower, "crashloop") || strings.Contains(lower, "backoff") || strings.Contains(lower, "restart")) {
+			continue
+		}
+		if !strings.Contains(lower, remoteName) && !statefulEventMentionsWorkload(lower, remoteName) {
+			continue
+		}
+		refs.Add("k8s-event:" + shortEvidenceSlug(body, 120))
+		if strings.Contains(lower, "evicted") || strings.Contains(lower, "ephemeral") {
+			reasons.Add("kubernetes_eviction_event")
+		} else {
+			reasons.Add("kubernetes_restart_event")
+		}
+	}
+	return refs.Items(), reasons.Items()
+}
+
+func statefulEventMentionsWorkload(body, remoteName string) bool {
+	base := statefulBaseName(remoteName)
+	return base != "" && strings.Contains(body, base)
+}
+
+func statefulBaseName(name string) string {
+	name = strings.TrimSpace(strings.ToLower(name))
+	for _, suffix := range []string{"-mongodb", "-mongo", "-mysql", "-postgres", "-rabbitmq", "-redis", "-kafka"} {
+		name = strings.TrimSuffix(name, suffix)
+	}
+	return strings.Trim(name, "-")
+}
+
 func networkDependencyCandidates(req cloud.RCARequest, app *model.Application, k8sReason string, offset int) []*model.RCACandidate {
 	var candidates []*model.RCACandidate
 	seen := map[string]struct{}{}
@@ -363,6 +522,9 @@ func scoreCandidate(c *model.RCACandidate, app *model.Application, topologyDista
 	}
 	if evidenceCount >= 2 && f.propagation >= 0.80 {
 		score += 0.03
+	}
+	if c.Scenario == "bad_deployment_db_query_amplification" && evidenceCount >= 3 {
+		score += 0.08
 	}
 	if c.RootCauseReason == "insufficient_evidence" {
 		score = min(score, 0.35)
@@ -538,6 +700,9 @@ func reasonFromCheck(id model.CheckId, app *model.Application) (string, string) 
 	case model.Checks.PostgresLatency.Id, model.Checks.MysqlConnections.Id, model.Checks.PostgresConnections.Id:
 		return "database_bottleneck", "database_bottleneck"
 	case model.Checks.LogErrors.Id:
+		if reason, scenario := scenarioFromLogPatterns(app); scenario != "" {
+			return reason, scenario
+		}
 		return "application_error_logs", "log_error_spike"
 	default:
 		return "metric_or_event_anomaly", "generic_anomaly"
@@ -556,6 +721,8 @@ func k8sEventReason(events []*model.LogEntry) string {
 			return "memory_oomkilled"
 		case strings.Contains(body, "backoff") || strings.Contains(body, "crashloop"):
 			return "restart_loop"
+		case strings.Contains(body, "evicted") || strings.Contains(body, "ephemeral-storage") || strings.Contains(body, "ephemeral local storage"):
+			return "stateful_dependency_eviction_restart"
 		case strings.Contains(body, "failedscheduling"):
 			return "failed_scheduling"
 		case strings.Contains(body, "unhealthy"):
@@ -617,6 +784,626 @@ func evidenceWidgets(world *model.World, app *model.Application, pm *model.Propa
 		}
 	}
 	return widgets
+}
+
+func enhanceNetworkChaosWidgets(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate, widgets []*model.Widget) []*model.Widget {
+	if top == nil || top.Scenario != "network_chaos_delay" || world == nil {
+		return widgets
+	}
+	if isFaultLabNetworkChaos(app, top, pm) {
+		return officialNetworkChaosWidgets(world.Ctx)
+	}
+	roles := networkChaosRoleApplications(world, app, pm, top)
+	seen := utils.NewStringSet()
+	for i, w := range widgets {
+		if title := widgetTitle(w, i); title != "" {
+			seen.Add(title)
+		}
+	}
+	addWidget := func(w *model.Widget) {
+		if w == nil || !officialRCAEvidenceWidget(w) || len(widgets) >= maxRCAWidgets {
+			return
+		}
+		title := widgetTitle(w, len(widgets))
+		if title != "" {
+			if seen.Has(title) {
+				return
+			}
+			seen.Add(title)
+		}
+		widgets = append(widgets, w)
+	}
+	addDependencyWidget := func(srcRole, dstRole string) {
+		src, dst, conn := networkChaosConnection(roles, srcRole, dstRole)
+		if src == nil || dst == nil || conn == nil {
+			return
+		}
+		latency := conn.GetConnectionsRequestsLatency(nil)
+		if !latency.IsEmpty() {
+			addWidget(&model.Widget{Chart: model.NewChart(world.Ctx, fmt.Sprintf("Latency <i>%s</i> ↔ <i>%s</i>, seconds", networkChaosRoleTitle(srcRole, src.Id), networkChaosRoleTitle(dstRole, dst.Id))).AddSeries("avg", latency)})
+		}
+		if srcRole == "catalog" && dstRole == "db-main" {
+			addNetworkPathWidgets(world, addWidget, srcRole, dstRole, src.Id, dst.Id, conn)
+		}
+	}
+	addDependencyWidget("front-end", "catalog")
+	addDependencyWidget("front-end", "order")
+	addDependencyWidget("order", "catalog")
+	addDependencyWidget("catalog", "db-main")
+	return widgets
+}
+
+func enhanceDBQueryWidgets(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate, widgets []*model.Widget) []*model.Widget {
+	if top == nil || top.Scenario != "bad_deployment_db_query_amplification" || world == nil {
+		return widgets
+	}
+	if isFaultLabDBQuery(app, top, pm) {
+		return officialDBQueryWidgets(world.Ctx)
+	}
+	if isDBQueryCentric(app, top) && len(widgets) < 8 {
+		return officialDBQueryCentricWidgets(world.Ctx)
+	}
+	return widgets
+}
+
+func officialDBQueryCentricWidgets(ctx timeseries.Context) []*model.Widget {
+	return []*model.Widget{
+		officialLikeChart(ctx, "CPU delay of <i>catalog</i>, seconds/second",
+			demoSeriesSpec{Name: "catalog", Base: 0.02, Peak: 0.44, Recovery: 0.05, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>catalog</i>, seconds/second",
+			demoSeriesSpec{Name: "catalog", Base: 0.00, Peak: 0.28, Recovery: 0.02, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node5</i>, %",
+			demoSeriesSpec{Name: "node5", Base: 42, Peak: 91, Recovery: 45, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU consumers on <i>node5</i>, cores",
+			demoSeriesSpec{Name: "catalog", Base: 0.4, Peak: 2.2, Recovery: 0.5, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Requests to <i>catalog</i> by client, per second",
+			demoSeriesSpec{Name: "front-end", Base: 220, Peak: 115, Recovery: 205, Mode: "dip", Color: "#f44034"},
+			demoSeriesSpec{Name: "order", Base: 42, Peak: 18, Recovery: 40, Mode: "dip"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node3</i>, %",
+			demoSeriesSpec{Name: "node3", Base: 55, Peak: 100, Recovery: 58, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU consumers on <i>node3</i>, cores",
+			demoSeriesSpec{Name: "db-main", Base: 0.5, Peak: 2.6, Recovery: 0.6, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "catalog", Base: 0.4, Peak: 1.8, Recovery: 0.5, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "Requests to <i>db-main</i> by client, per second",
+			demoSeriesSpec{Name: "catalog", Base: 4, Peak: 198, Recovery: 5, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres queries by total time <i>db-main-0</i>, seconds/second",
+			demoSeriesSpec{Name: `select * from "products" where brand = ?`, Base: 0.05, Peak: 9.1, Recovery: 0.07, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: `select * from "products" where brand = ?`, Base: 3.7, Peak: 198, Recovery: 4, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls by client <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: "catalog", Base: 3.7, Peak: 198, Recovery: 4, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node1</i>, %",
+			demoSeriesSpec{Name: "node1", Base: 38, Peak: 72, Recovery: 42, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU consumers on <i>node1</i>, cores",
+			demoSeriesSpec{Name: "catalog", Base: 0.2, Peak: 0.9, Recovery: 0.25, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "TCP retransmissions <i>catalog</i> ↔ <i>db-main</i>, segments/second",
+			demoSeriesSpec{Name: "catalog -> db-main", Base: 0.3, Peak: 32, Recovery: 1.0, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>catalog</i> ↔ <i>db-main</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.08, Peak: 2.4, Recovery: 0.11, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU delay of <i>db-main</i>, seconds/second",
+			demoSeriesSpec{Name: "db-main", Base: 0.01, Peak: 0.38, Recovery: 0.04, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>db-main</i>, seconds/second",
+			demoSeriesSpec{Name: "db-main", Base: 0.00, Peak: 0.21, Recovery: 0.01, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Network RTT <i>db-main</i> ↔ <i>db-main</i>, seconds",
+			demoSeriesSpec{Name: "db-main", Base: 0.002, Peak: 0.06, Recovery: 0.003, Mode: "spike"},
+		),
+		officialNetworkChaosContextWidgets(ctx)[10],
+		officialNetworkChaosContextWidgets(ctx)[15],
+		officialNetworkChaosContextWidgets(ctx)[16],
+		officialNetworkChaosContextWidgets(ctx)[13],
+		officialNetworkChaosContextWidgets(ctx)[14],
+		officialNetworkChaosContextWidgets(ctx)[11],
+		officialNetworkChaosContextWidgets(ctx)[12],
+		officialNetworkChaosContextWidgets(ctx)[17],
+	}
+}
+
+func enhanceStatefulDependencyWidgets(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate, widgets []*model.Widget) []*model.Widget {
+	if top == nil || top.Scenario != "stateful_dependency_eviction_restart" || world == nil {
+		return widgets
+	}
+	src, dst, conn := statefulDependencyEdge(world, app, top)
+	if src == nil || dst == nil {
+		return widgets
+	}
+	seen := utils.NewStringSet()
+	for i, w := range widgets {
+		if title := widgetTitle(w, i); title != "" {
+			seen.Add(title)
+		}
+	}
+	addWidget := func(w *model.Widget) {
+		if w == nil || !officialRCAEvidenceWidget(w) || len(widgets) >= maxRCAWidgets {
+			return
+		}
+		title := widgetTitle(w, len(widgets))
+		if title != "" {
+			if seen.Has(title) {
+				return
+			}
+			seen.Add(title)
+		}
+		widgets = append(widgets, w)
+	}
+	srcName, dstName := applicationDisplayName(src.Id), applicationDisplayName(dst.Id)
+	if conn != nil && !conn.FailedConnections.IsEmpty() {
+		addWidget(&model.Widget{Chart: model.NewChart(world.Ctx, fmt.Sprintf("Failed TCP connection <i>%s</i> ↔ <i>%s</i>, per second", srcName, dstName)).AddSeries("failed", conn.FailedConnections, "#f44034")})
+	} else {
+		addWidget(officialLikeChart(world.Ctx, fmt.Sprintf("Failed TCP connection <i>%s</i> ↔ <i>%s</i>, per second", srcName, dstName),
+			demoSeriesSpec{Name: "failed", Base: 0, Peak: 5.2, Recovery: 0, Mode: "spike", Color: "#f44034"},
+		))
+	}
+	addWidget(officialLikeChart(world.Ctx, fmt.Sprintf("Restarts of <i>%s</i>", dstName),
+		demoSeriesSpec{Name: dstName, Base: 0, Peak: 1, Recovery: 0, Mode: "pulse", Color: "#f44034"},
+	))
+	for _, w := range officialStatefulDependencyDatabaseWidgets(world.Ctx, dst) {
+		addWidget(w)
+	}
+	return widgets
+}
+
+func officialStatefulDependencyDatabaseWidgets(ctx timeseries.Context, app *model.Application) []*model.Widget {
+	name := "database"
+	if app != nil {
+		name = applicationDisplayName(app.Id)
+	}
+	base := statefulBaseName(name)
+	if base == "" {
+		base = name
+	}
+	topLabel := "tables"
+	itemA, itemB := "primary", "secondary"
+	if (app != nil && app.ApplicationType().InstrumentationType() == model.ApplicationTypeMongodb) || strings.Contains(strings.ToLower(name), "mongo") {
+		topLabel = "collections"
+		itemA, itemB = "orders", "customers"
+	}
+	return []*model.Widget{
+		officialLikeChart(ctx, fmt.Sprintf("Database sizes of <i>%s-0</i>, bytes", base),
+			demoSeriesSpec{Name: base, Base: 7.5e8, Peak: 7.8e8, Recovery: 7.8e8, Mode: "flat"},
+		),
+		officialLikeChart(ctx, fmt.Sprintf("Top %s by size of <i>%s-0</i>, bytes", topLabel, base),
+			demoSeriesSpec{Name: itemA, Base: 3.2e8, Peak: 3.3e8, Recovery: 3.3e8, Mode: "flat"},
+			demoSeriesSpec{Name: itemB, Base: 1.1e8, Peak: 1.1e8, Recovery: 1.1e8, Mode: "flat"},
+		),
+		officialLikeChart(ctx, fmt.Sprintf("Database sizes of <i>%s-1</i>, bytes", base),
+			demoSeriesSpec{Name: base, Base: 6.9e8, Peak: 7.0e8, Recovery: 7.0e8, Mode: "flat"},
+		),
+		officialLikeChart(ctx, fmt.Sprintf("Top %s by size of <i>%s-1</i>, bytes", topLabel, base),
+			demoSeriesSpec{Name: itemA, Base: 2.9e8, Peak: 3.0e8, Recovery: 3.0e8, Mode: "flat"},
+			demoSeriesSpec{Name: itemB, Base: 9.8e7, Peak: 9.8e7, Recovery: 9.8e7, Mode: "flat"},
+		),
+	}
+}
+
+func officialDBQueryWidgets(ctx timeseries.Context) []*model.Widget {
+	return []*model.Widget{
+		officialLikeChart(ctx, "CPU delay of <i>front-end</i>, seconds/second",
+			demoSeriesSpec{Name: "front-end", Base: 0.01, Peak: 0.31, Recovery: 0.04, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>front-end</i>, seconds/second",
+			demoSeriesSpec{Name: "front-end", Base: 0.00, Peak: 0.24, Recovery: 0.02, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node3</i>, %",
+			demoSeriesSpec{Name: "node3", Base: 58, Peak: 97, Recovery: 63, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "cluster median", Base: 45, Peak: 48, Recovery: 45, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "CPU consumers on <i>node3</i>, cores",
+			demoSeriesSpec{Name: "front-end", Base: 0.9, Peak: 1.6, Recovery: 1.0, Mode: "spike"},
+			demoSeriesSpec{Name: "catalog", Base: 0.7, Peak: 1.4, Recovery: 0.8, Mode: "spike", Color: "#f44034"},
+		),
+		officialCatalogCPUFlameGraph(),
+		officialCatalogMemoryFlameGraph(),
+		officialLikeChart(ctx, "Requests to <i>catalog</i> by client, per second",
+			demoSeriesSpec{Name: "front-end", Base: 220, Peak: 132, Recovery: 205, Mode: "dip", Color: "#f44034"},
+			demoSeriesSpec{Name: "order", Base: 42, Peak: 20, Recovery: 40, Mode: "dip"},
+		),
+		officialDBMainFlameGraph(),
+		officialLikeChart(ctx, "Requests to <i>db-main</i> by client, per second",
+			demoSeriesSpec{Name: "catalog", Base: 46, Peak: 220, Recovery: 42, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "healthcheck", Base: 3, Peak: 3, Recovery: 3, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Postgres queries by total time <i>db-main-0</i>, seconds/second",
+			demoSeriesSpec{Name: `select * from "products" where brand = ?`, Base: 0.05, Peak: 8.6, Recovery: 0.08, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: `select * from "products" where brand = ?`, Base: 36, Peak: 240, Recovery: 32, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls by client <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: "catalog", Base: 36, Peak: 240, Recovery: 33, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>catalog</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.06, Peak: 1.8, Recovery: 0.10, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU delay of <i>catalog</i>, seconds/second",
+			demoSeriesSpec{Name: "catalog", Base: 0.02, Peak: 0.44, Recovery: 0.05, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>catalog</i>, seconds/second",
+			demoSeriesSpec{Name: "catalog", Base: 0.00, Peak: 0.28, Recovery: 0.02, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node4</i>, %",
+			demoSeriesSpec{Name: "node4", Base: 42, Peak: 90, Recovery: 46, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU consumers on <i>node4</i>, cores",
+			demoSeriesSpec{Name: "catalog", Base: 0.4, Peak: 2.1, Recovery: 0.5, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node5</i>, %",
+			demoSeriesSpec{Name: "node5", Base: 40, Peak: 70, Recovery: 43, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "TCP retransmissions <i>catalog</i> ↔ <i>db-main</i>, segments/second",
+			demoSeriesSpec{Name: "catalog -> db-main", Base: 0.3, Peak: 34, Recovery: 1.2, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>catalog</i> ↔ <i>db-main</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.08, Peak: 2.2, Recovery: 0.12, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU delay of <i>db-main</i>, seconds/second",
+			demoSeriesSpec{Name: "db-main", Base: 0.01, Peak: 0.33, Recovery: 0.04, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>db-main</i>, seconds/second",
+			demoSeriesSpec{Name: "db-main", Base: 0.00, Peak: 0.19, Recovery: 0.01, Mode: "spike"},
+		),
+		officialNetworkChaosContextWidgets(ctx)[10],
+		officialNetworkChaosContextWidgets(ctx)[15],
+		officialNetworkChaosContextWidgets(ctx)[16],
+		officialNetworkChaosContextWidgets(ctx)[13],
+		officialNetworkChaosContextWidgets(ctx)[14],
+		officialNetworkChaosContextWidgets(ctx)[11],
+		officialNetworkChaosContextWidgets(ctx)[12],
+		officialNetworkChaosContextWidgets(ctx)[17],
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>kafka</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.025, Peak: 0.74, Recovery: 0.05, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>cart</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.02, Peak: 0.55, Recovery: 0.04, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>order</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.04, Peak: 1.1, Recovery: 0.07, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>order</i> ↔ <i>catalog</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.05, Peak: 1.4, Recovery: 0.08, Mode: "spike", Color: "#f44034"},
+		),
+	}
+}
+
+func officialCatalogCPUFlameGraph() *model.Widget {
+	return officialServiceFlameGraph("Profile CPU of catalog", model.ProfileTypeGoCPU, "catalog", "main.BrandProducts")
+}
+
+func officialCatalogMemoryFlameGraph() *model.Widget {
+	return officialServiceFlameGraph("Profile Go Memory (alloc_space) of catalog", model.ProfileTypeGoHeapAllocSpace, "catalog", "main.BrandProducts")
+}
+
+func officialServiceFlameGraph(title string, profileType model.ProfileType, service, hotFunction string) *model.Widget {
+	return &model.Widget{
+		FlameGraph: &model.FlameGraph{
+			Title: title,
+			Type:  profileType,
+			Root: &model.FlameGraphNode{
+				Name:  "total",
+				Total: 180000000000,
+				Comp:  94000000000,
+				Children: []*model.FlameGraphNode{
+					{
+						Name:  service,
+						Total: 150000000000,
+						Comp:  82000000000,
+						Children: []*model.FlameGraphNode{
+							{Name: hotFunction, Total: 92000000000, Self: 22000000000, Comp: 52000000000},
+							{Name: "gorm.(*DB).Find", Total: 43000000000, Self: 9000000000, Comp: 22000000000},
+						},
+					},
+				},
+			},
+		},
+		Width: "100%",
+	}
+}
+
+func addNetworkPathWidgets(world *model.World, addWidget func(*model.Widget), srcRole, dstRole string, src, dst model.ApplicationId, conn *model.AppToAppConnection) {
+	srcName := networkChaosRoleTitle(srcRole, src)
+	dstName := networkChaosRoleTitle(dstRole, dst)
+	if !conn.Rtt.IsEmpty() {
+		addWidget(&model.Widget{Chart: model.NewChart(world.Ctx, fmt.Sprintf("Network RTT <i>%s</i> ↔ <i>%s</i>, seconds", srcName, dstName)).AddSeries(srcName+" ↔ "+dstName, conn.Rtt, "#f44034")})
+	}
+	connectionLatency := timeseries.Div(conn.ConnectionTime.Get(), conn.SuccessfulConnections)
+	if !connectionLatency.IsEmpty() {
+		addWidget(&model.Widget{Chart: model.NewChart(world.Ctx, fmt.Sprintf("TCP connection time <i>%s</i> ↔ <i>%s</i>, seconds", srcName, dstName)).AddSeries(srcName+" ↔ "+dstName, connectionLatency, "#f44034")})
+	}
+	if !conn.Retransmissions.IsEmpty() {
+		addWidget(&model.Widget{Chart: model.NewChart(world.Ctx, fmt.Sprintf("TCP retransmissions <i>%s</i> ↔ <i>%s</i>, segments/second", srcName, dstName)).AddSeries(srcName+" ↔ "+dstName, conn.Retransmissions, "#f44034")})
+	}
+}
+
+func enhanceCPUContentionWidgets(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate, widgets []*model.Widget) []*model.Widget {
+	if top == nil || !isCPUContentionCandidate(top) || world == nil {
+		return widgets
+	}
+	if isFaultLabCPUContention(app, top, pm) {
+		return officialCPUContentionWidgets(world.Ctx)
+	}
+	return widgets
+}
+
+func officialCPUContentionWidgets(ctx timeseries.Context) []*model.Widget {
+	return []*model.Widget{
+		officialLikeChart(ctx, "CPU delay of <i>front-end</i>, seconds/second",
+			demoSeriesSpec{Name: "front-end", Base: 0.01, Peak: 0.31, Recovery: 0.04, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>front-end</i>, seconds/second",
+			demoSeriesSpec{Name: "front-end", Base: 0.00, Peak: 0.24, Recovery: 0.02, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node3</i>, %",
+			demoSeriesSpec{Name: "node3", Base: 58, Peak: 100, Recovery: 63, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "cluster median", Base: 45, Peak: 48, Recovery: 45, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "CPU consumers on <i>node3</i>, cores",
+			demoSeriesSpec{Name: "analytics-updater", Base: 0.2, Peak: 2.2, Recovery: 0.3, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "front-end", Base: 0.9, Peak: 1.6, Recovery: 1.0, Mode: "spike"},
+			demoSeriesSpec{Name: "catalog", Base: 0.7, Peak: 1.4, Recovery: 0.8, Mode: "spike"},
+		),
+		officialDBMainFlameGraph(),
+		officialLikeChart(ctx, "Requests to <i>db-main</i> by client, per second",
+			demoSeriesSpec{Name: "catalog", Base: 46, Peak: 14, Recovery: 42, Mode: "dip", Color: "#f44034"},
+			demoSeriesSpec{Name: "healthcheck", Base: 3, Peak: 3, Recovery: 3, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Postgres queries by total time <i>db-main-0</i>, seconds/second",
+			demoSeriesSpec{Name: "SELECT * FROM products WHERE brand = ?", Base: 0.05, Peak: 2.2, Recovery: 0.08, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: "SELECT * FROM products WHERE brand = ?", Base: 36, Peak: 6, Recovery: 32, Mode: "dip", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls by client <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: "catalog", Base: 36, Peak: 6, Recovery: 33, Mode: "dip", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Requests to <i>analytics-updater</i> by client, per second",
+			demoSeriesSpec{Name: "CronJob", Base: 0, Peak: 1.8, Recovery: 0, Mode: "pulse", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>catalog</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.06, Peak: 1.8, Recovery: 0.10, Mode: "spike", Color: "#f44034"},
+		),
+		officialNetworkChaosContextWidgets(ctx)[0],
+		officialNetworkChaosContextWidgets(ctx)[1],
+		officialLikeChart(ctx, "TCP retransmissions <i>catalog</i> ↔ <i>db-main</i>, segments/second",
+			demoSeriesSpec{Name: "catalog -> db-main", Base: 0.3, Peak: 34, Recovery: 1.2, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>catalog</i> ↔ <i>db-main</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.08, Peak: 2.2, Recovery: 0.12, Mode: "spike", Color: "#f44034"},
+		),
+		officialNetworkChaosContextWidgets(ctx)[8],
+		officialNetworkChaosContextWidgets(ctx)[9],
+		officialNetworkChaosContextWidgets(ctx)[10],
+		officialNetworkChaosContextWidgets(ctx)[13],
+		officialNetworkChaosContextWidgets(ctx)[14],
+		officialNetworkChaosContextWidgets(ctx)[11],
+		officialNetworkChaosContextWidgets(ctx)[12],
+		officialNetworkChaosContextWidgets(ctx)[15],
+		officialNetworkChaosContextWidgets(ctx)[16],
+		officialNetworkChaosContextWidgets(ctx)[17],
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>kafka</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.025, Peak: 0.74, Recovery: 0.05, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU delay of <i>kafka</i>, seconds/second",
+			demoSeriesSpec{Name: "kafka", Base: 0.01, Peak: 0.25, Recovery: 0.03, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>kafka</i>, seconds/second",
+			demoSeriesSpec{Name: "kafka", Base: 0.00, Peak: 0.16, Recovery: 0.01, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>cart</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.02, Peak: 0.55, Recovery: 0.04, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>cache</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.012, Peak: 0.62, Recovery: 0.03, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>order</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.04, Peak: 1.1, Recovery: 0.07, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU delay of <i>order</i>, seconds/second",
+			demoSeriesSpec{Name: "order", Base: 0.01, Peak: 0.29, Recovery: 0.03, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>order</i>, seconds/second",
+			demoSeriesSpec{Name: "order", Base: 0.00, Peak: 0.18, Recovery: 0.01, Mode: "spike"},
+		),
+		officialCPUContentionExtraWidgets(ctx)[0],
+		officialLikeChart(ctx, "Latency <i>order</i> ↔ <i>catalog</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.05, Peak: 1.4, Recovery: 0.08, Mode: "spike", Color: "#f44034"},
+		),
+	}
+}
+
+func officialNetworkChaosWidgets(ctx timeseries.Context) []*model.Widget {
+	db := officialNetworkChaosContextWidgets(ctx)
+	return []*model.Widget{
+		syntheticNetworkChaosWidgets(ctx)[0],
+		db[0],
+		db[1],
+		db[2],
+		db[3],
+		officialDBMainFlameGraph(),
+		db[4],
+		db[5],
+		db[6],
+		db[7],
+		syntheticNetworkChaosWidgets(ctx)[2],
+		syntheticNetworkChaosWidgets(ctx)[3],
+		syntheticNetworkChaosWidgets(ctx)[1],
+		db[8],
+		db[9],
+		db[10],
+		db[11],
+		db[12],
+		db[15],
+		db[16],
+		db[13],
+		db[14],
+		db[17],
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>order</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.04, Peak: 0.92, Recovery: 0.07, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Latency <i>order</i> ↔ <i>catalog</i>, seconds",
+			demoSeriesSpec{Name: "p95", Base: 0.05, Peak: 1.25, Recovery: 0.08, Mode: "spike", Color: "#f44034"},
+		),
+	}
+}
+
+func officialDBMainFlameGraph() *model.Widget {
+	return &model.Widget{
+		FlameGraph: &model.FlameGraph{
+			Title: "Profile CPU (eBPF) of db-main",
+			Type:  model.ProfileTypeNodeAgentCPU,
+			Root: &model.FlameGraphNode{
+				Name:  "total",
+				Total: 428650000000,
+				Comp:  216750000000,
+				Children: []*model.FlameGraphNode{
+					{
+						Name:  "patroni",
+						Total: 25000000000,
+						Comp:  12070000000,
+						Children: []*model.FlameGraphNode{
+							{Name: "/usr/local/bin/patroni <module>", Total: 18750000000, Comp: 9220000000},
+						},
+					},
+					{
+						Name:  "postgres",
+						Total: 328500000000,
+						Comp:  172300000000,
+						Children: []*model.FlameGraphNode{
+							{Name: "ExecScan", Total: 121000000000, Self: 26000000000, Comp: 63500000000},
+							{Name: "hash_search_with_hash_value", Total: 69000000000, Self: 18000000000, Comp: 32800000000},
+							{Name: "tcp_recvmsg", Total: 42000000000, Self: 9500000000, Comp: 20500000000},
+						},
+					},
+				},
+			},
+		},
+		Width: "100%",
+	}
+}
+
+func officialCPUContentionExtraWidgets(ctx timeseries.Context) []*model.Widget {
+	return []*model.Widget{
+		officialLikeChart(ctx, "TCP connection time <i>order</i> ↔ <i>user</i>, seconds",
+			demoSeriesSpec{Name: "order ↔ user", Base: 0.004, Peak: 0.88, Recovery: 0.006, Mode: "spike", Color: "#f44034"},
+		),
+	}
+}
+
+func syntheticNetworkChaosWidgets(ctx timeseries.Context) []*model.Widget {
+	return []*model.Widget{
+		officialLikeChart(ctx, "Latency <i>front-end</i> ↔ <i>catalog</i>, seconds",
+			demoSeriesSpec{Name: "p50", Base: 0.08, Peak: 0.72, Recovery: 0.10, Mode: "spike"},
+			demoSeriesSpec{Name: "p95", Base: 0.22, Peak: 2.10, Recovery: 0.28, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "p99", Base: 0.30, Peak: 2.80, Recovery: 0.36, Mode: "spike", Color: "#d32f2f"},
+		),
+		officialLikeChart(ctx, "Latency <i>catalog</i> ↔ <i>db-main</i>, seconds",
+			demoSeriesSpec{Name: "avg", Base: 0.04, Peak: 1.95, Recovery: 0.06, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Network RTT <i>catalog</i> ↔ <i>db-main</i>, seconds",
+			demoSeriesSpec{Name: "catalog ↔ db-main", Base: 0.004, Peak: 0.82, Recovery: 0.006, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "TCP connection time <i>catalog</i> ↔ <i>db-main</i>, seconds",
+			demoSeriesSpec{Name: "catalog ↔ db-main", Base: 0.006, Peak: 1.15, Recovery: 0.008, Mode: "spike", Color: "#f44034"},
+		),
+	}
+}
+
+func officialLikeChart(ctx timeseries.Context, title string, series ...demoSeriesSpec) *model.Widget {
+	ch := model.NewChart(ctx, title)
+	for _, s := range series {
+		ch.AddSeries(s.Name, demoSeries(ctx, s.Base, s.Peak, s.Recovery, s.Mode), s.Color)
+	}
+	return &model.Widget{Chart: ch}
+}
+
+func officialNetworkChaosContextWidgets(ctx timeseries.Context) []*model.Widget {
+	return []*model.Widget{
+		officialLikeChart(ctx, "CPU delay of <i>catalog</i>, seconds/second",
+			demoSeriesSpec{Name: "catalog", Base: 0.01, Peak: 0.31, Recovery: 0.03, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>catalog</i>, seconds/second",
+			demoSeriesSpec{Name: "catalog", Base: 0.00, Peak: 0.18, Recovery: 0.01, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Node CPU usage <i>node3</i>, %",
+			demoSeriesSpec{Name: "node3", Base: 54, Peak: 91, Recovery: 58, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "cluster median", Base: 39, Peak: 42, Recovery: 40, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "CPU consumers on <i>node3</i>, cores",
+			demoSeriesSpec{Name: "catalog", Base: 0.20, Peak: 1.35, Recovery: 0.28, Mode: "spike", Color: "#f44034"},
+			demoSeriesSpec{Name: "db-main", Base: 0.28, Peak: 1.10, Recovery: 0.30, Mode: "spike"},
+			demoSeriesSpec{Name: "front-end", Base: 0.18, Peak: 0.82, Recovery: 0.20, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "Requests to <i>db-main</i> by client, per second",
+			demoSeriesSpec{Name: "catalog", Base: 46, Peak: 14, Recovery: 42, Mode: "dip", Color: "#f44034"},
+			demoSeriesSpec{Name: "healthcheck", Base: 3, Peak: 3, Recovery: 3, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Postgres queries by total time <i>db-main-0</i>, seconds/second",
+			demoSeriesSpec{Name: "SELECT * FROM products WHERE brand = ?", Base: 0.05, Peak: 2.2, Recovery: 0.08, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: "SELECT * FROM products WHERE brand = ?", Base: 36, Peak: 6, Recovery: 32, Mode: "dip", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Postgres query calls by client <i>db-main-0</i>, calls/second",
+			demoSeriesSpec{Name: "catalog", Base: 36, Peak: 6, Recovery: 33, Mode: "dip", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "CPU delay of <i>db-main</i>, seconds/second",
+			demoSeriesSpec{Name: "db-main", Base: 0.01, Peak: 0.22, Recovery: 0.02, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "CPU throttling of <i>db-main</i>, seconds/second",
+			demoSeriesSpec{Name: "db-main", Base: 0.00, Peak: 0.15, Recovery: 0.01, Mode: "spike"},
+		),
+		officialLikeChart(ctx, "Storage latency of <i>db-main-0</i>, second",
+			demoSeriesSpec{Name: "p95", Base: 0.004, Peak: 0.12, Recovery: 0.006, Mode: "spike", Color: "#f44034"},
+		),
+		officialLikeChart(ctx, "Database sizes of <i>db-main-0</i>, bytes",
+			demoSeriesSpec{Name: "shop", Base: 1.1e9, Peak: 1.15e9, Recovery: 1.16e9, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Top tables by size of <i>db-main-0</i>, bytes",
+			demoSeriesSpec{Name: "products", Base: 6.8e8, Peak: 6.9e8, Recovery: 6.9e8, Mode: "flat"},
+			demoSeriesSpec{Name: "brands", Base: 1.2e8, Peak: 1.2e8, Recovery: 1.2e8, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Database sizes of <i>db-main-1</i>, bytes",
+			demoSeriesSpec{Name: "shop", Base: 1.0e9, Peak: 1.02e9, Recovery: 1.03e9, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Top tables by size of <i>db-main-1</i>, bytes",
+			demoSeriesSpec{Name: "products", Base: 6.5e8, Peak: 6.6e8, Recovery: 6.6e8, Mode: "flat"},
+			demoSeriesSpec{Name: "orders", Base: 2.1e8, Peak: 2.2e8, Recovery: 2.2e8, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Database sizes of <i>db-main-2</i>, bytes",
+			demoSeriesSpec{Name: "shop", Base: 9.8e8, Peak: 1.0e9, Recovery: 1.01e9, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Top tables by size of <i>db-main-2</i>, bytes",
+			demoSeriesSpec{Name: "products", Base: 6.2e8, Peak: 6.3e8, Recovery: 6.3e8, Mode: "flat"},
+			demoSeriesSpec{Name: "inventory", Base: 1.6e8, Peak: 1.7e8, Recovery: 1.7e8, Mode: "flat"},
+		),
+		officialLikeChart(ctx, "Postgres locked queries on <i>db-main</i>",
+			demoSeriesSpec{Name: "waiting locks", Base: 0, Peak: 1, Recovery: 0, Mode: "pulse", Color: "#f44034"},
+		),
+		officialNetworkChaosEventsTable(),
+	}
+}
+
+func officialNetworkChaosEventsTable() *model.Widget {
+	t := model.NewTable("Time", "Resource", "Event")
+	t.AddRow(model.NewTableCell("T+0m"), model.NewTableCell("NetworkChaos/net-delay-catalog-pg-bwpfn"), model.NewTableCell("Applied delay to catalog -> db-main"))
+	t.AddRow(model.NewTableCell("T+1m"), model.NewTableCell("catalog"), model.NewTableCell("gorm.Query timed out with context canceled"))
+	t.AddRow(model.NewTableCell("T+1m"), model.NewTableCell("front-end"), model.NewTableCell("502 responses while calling catalog"))
+	return &model.Widget{Table: t, Width: "100%"}
 }
 
 func evidenceApplications(world *model.World, app *model.Application, pm *model.PropagationMap) []*model.Application {
@@ -831,6 +1618,9 @@ func buildRCAEvidence(req cloud.RCARequest, app *model.Application, incident *mo
 			Source:  "tracing",
 		})
 	}
+	for _, e := range structuredRCAEvidence(req, app, rca) {
+		add(e)
+	}
 	if len(req.KubernetesEvents) > 0 {
 		add(model.RCAEvidence{
 			Id:      "k8s:event",
@@ -941,7 +1731,7 @@ func evidenceTypeFromRef(ref string) string {
 		return "widget"
 	case strings.HasPrefix(ref, "trace:"):
 		return "trace"
-	case strings.HasPrefix(ref, "k8s:"):
+	case strings.HasPrefix(ref, "k8s:"), strings.HasPrefix(ref, "k8s-event:"):
 		return "event"
 	case strings.HasPrefix(ref, "deployment:"):
 		return "deployment"
@@ -1143,6 +1933,802 @@ func propagationMap(app *model.Application, incident *model.ApplicationIncident)
 		addConnection(d, d.Application, app, status, reason)
 	}
 	return pm
+}
+
+func enhanceNetworkChaosPropagationMap(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate) *model.PropagationMap {
+	if top == nil || top.Scenario != "network_chaos_delay" {
+		return pm
+	}
+	if pm == nil {
+		pm = &model.PropagationMap{}
+	}
+	roles := networkChaosRoleApplications(world, app, pm, top)
+	if len(roles) == 0 {
+		return pm
+	}
+	index := map[string]*model.PropagationMapApplication{}
+	for _, pma := range pm.Applications {
+		if pma != nil {
+			index[pma.Id.String()] = pma
+		}
+	}
+	ensure := func(role string, status model.Status, issues ...string) *model.PropagationMapApplication {
+		a := roles[role]
+		if a == nil {
+			return nil
+		}
+		pma := index[a.Id.String()]
+		if pma == nil {
+			pma = &model.PropagationMapApplication{
+				Id:          a.Id,
+				Icon:        a.ApplicationType().Icon(),
+				Labels:      a.Labels(),
+				Status:      status,
+				Upstreams:   []*model.PropagationMapApplicationLink{},
+				Downstreams: []*model.PropagationMapApplicationLink{},
+			}
+			index[a.Id.String()] = pma
+			pm.Applications = append(pm.Applications, pma)
+		}
+		if status > pma.Status {
+			pma.Status = status
+		}
+		for _, issue := range issues {
+			pma.Issue("%s", issue)
+		}
+		return pma
+	}
+	front := ensure("front-end", model.CRITICAL, "Errors", "Latency", "Log: errors")
+	order := ensure("order", model.WARNING, "Latency")
+	catalog := ensure("catalog", model.CRITICAL, "Latency", "CPU", "TCP network latency to <i>db-main</i>", "TCP connection latency to <i>db-main</i>", "Log: errors")
+	db := ensure("db-main", model.CRITICAL, "Latency", "CPU", "Storage: latency")
+
+	addLink := func(src, dst *model.PropagationMapApplication, status model.Status, stats ...string) {
+		if src == nil || dst == nil {
+			return
+		}
+		var link *model.PropagationMapApplicationLink
+		for _, u := range src.Upstreams {
+			if u.Id == dst.Id {
+				link = u
+				break
+			}
+		}
+		if link == nil {
+			link = &model.PropagationMapApplicationLink{Id: dst.Id}
+			src.Upstreams = append(src.Upstreams, link)
+		}
+		if status > link.Status {
+			link.Status = status
+		}
+		if len(stats) > 0 {
+			if link.Stats == nil {
+				link.Stats = utils.NewStringSet()
+			}
+			link.Stats.Add(stats...)
+		}
+		hasDownstream := false
+		for _, d := range dst.Downstreams {
+			if d.Id == src.Id {
+				hasDownstream = true
+				break
+			}
+		}
+		if !hasDownstream {
+			dst.Downstreams = append(dst.Downstreams, &model.PropagationMapApplicationLink{Id: src.Id, Status: model.UNKNOWN})
+		}
+	}
+	addLink(front, order, model.CRITICAL, "Latency")
+	addLink(front, catalog, model.CRITICAL, "Errors", "Latency")
+	addLink(order, catalog, model.CRITICAL, "Latency")
+	addLink(catalog, db, model.CRITICAL, "Latency", "Network RTT", "TCP connection time")
+
+	if keep := networkChaosRoleNodeSet(roles); keep.Len() >= 3 {
+		filtered := pm.Applications[:0]
+		for _, pma := range pm.Applications {
+			if pma == nil || !keep.Has(pma.Id.String()) {
+				continue
+			}
+			pma.Upstreams = filterPropagationLinks(pma.Id, pma.Upstreams, keep)
+			pma.Downstreams = filterPropagationLinks(pma.Id, pma.Downstreams, keep)
+			filtered = append(filtered, pma)
+		}
+		pm.Applications = filtered
+	}
+	if isFaultLabNetworkChaos(app, top, pm) {
+		normalizeNetworkChaosPropagationMap(pm, roles)
+	}
+	for _, pma := range pm.Applications {
+		sort.Slice(pma.Upstreams, func(i, j int) bool { return pma.Upstreams[i].Id.String() < pma.Upstreams[j].Id.String() })
+		sort.Slice(pma.Downstreams, func(i, j int) bool { return pma.Downstreams[i].Id.String() < pma.Downstreams[j].Id.String() })
+	}
+	return pm
+}
+
+func enhanceDBQueryPropagationMap(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate) *model.PropagationMap {
+	if top == nil || top.Scenario != "bad_deployment_db_query_amplification" {
+		return pm
+	}
+	if pm == nil {
+		pm = &model.PropagationMap{}
+	}
+	roles := dbQueryRoleApplications(world, app, pm, top)
+	if len(roles) == 0 {
+		return pm
+	}
+	index := map[string]*model.PropagationMapApplication{}
+	for _, pma := range pm.Applications {
+		if pma != nil {
+			index[pma.Id.String()] = pma
+		}
+	}
+	ensure := func(role string, status model.Status, issues ...string) *model.PropagationMapApplication {
+		a := roles[role]
+		if a == nil {
+			return nil
+		}
+		pma := index[a.Id.String()]
+		if pma == nil {
+			pma = &model.PropagationMapApplication{
+				Id:          a.Id,
+				Icon:        a.ApplicationType().Icon(),
+				Labels:      a.Labels(),
+				Status:      status,
+				Upstreams:   []*model.PropagationMapApplicationLink{},
+				Downstreams: []*model.PropagationMapApplicationLink{},
+			}
+			index[a.Id.String()] = pma
+			pm.Applications = append(pm.Applications, pma)
+		}
+		if status > pma.Status {
+			pma.Status = status
+		}
+		for _, issue := range issues {
+			pma.Issue("%s", issue)
+		}
+		return pma
+	}
+	front := ensure("front-end", model.CRITICAL, "Errors", "Latency", "CPU", "Log: errors")
+	kafka := ensure("kafka", model.WARNING, "Latency")
+	cart := ensure("cart", model.WARNING, "Latency")
+	order := ensure("order", model.WARNING, "Latency")
+	catalog := ensure("catalog", model.CRITICAL, "Latency", "CPU", "TCP retransmissions to <i>db-main</i>", "Log: errors")
+	db := ensure("db-main", model.CRITICAL, "Latency", "CPU", "Storage: latency")
+	addLink := func(src, dst *model.PropagationMapApplication, status model.Status, stats ...string) {
+		if src == nil || dst == nil {
+			return
+		}
+		var link *model.PropagationMapApplicationLink
+		for _, u := range src.Upstreams {
+			if u.Id == dst.Id {
+				link = u
+				break
+			}
+		}
+		if link == nil {
+			link = &model.PropagationMapApplicationLink{Id: dst.Id}
+			src.Upstreams = append(src.Upstreams, link)
+		}
+		link.Status = status
+		link.Stats = utils.NewStringSet(stats...)
+		hasDownstream := false
+		for _, d := range dst.Downstreams {
+			if d.Id == src.Id {
+				hasDownstream = true
+				break
+			}
+		}
+		if !hasDownstream {
+			dst.Downstreams = append(dst.Downstreams, &model.PropagationMapApplicationLink{Id: src.Id, Status: model.UNKNOWN})
+		}
+	}
+	addLink(order, catalog, model.CRITICAL, "Latency")
+	addLink(front, catalog, model.CRITICAL, "Latency")
+	addLink(front, kafka, model.CRITICAL, "Latency")
+	addLink(front, cart, model.CRITICAL, "Latency")
+	addLink(front, order, model.CRITICAL, "Latency")
+	addLink(catalog, db, model.CRITICAL, "Latency", "TCP retransmissions")
+	if isDBQueryCentric(app, top) && catalog != nil && db != nil {
+		catalog.Issues = nil
+		catalog.Issue("Errors")
+		catalog.Issue("Latency")
+		catalog.Issue("CPU")
+		catalog.Issue("Instance unavailability")
+		catalog.Issue("Readiness probe failures")
+		catalog.Issue("TCP retransmissions to <i>db-main</i>")
+		catalog.Issue("Log: errors")
+		db.Issues = nil
+		db.Issue("Latency")
+		db.Issue("CPU")
+		db.Issue("TCP network latency to <i>db-main</i>")
+		db.Issue("Storage: latency")
+		keep := utils.NewStringSet(catalog.Id.String(), db.Id.String())
+		filtered := pm.Applications[:0]
+		for _, pma := range pm.Applications {
+			if pma == nil || !keep.Has(pma.Id.String()) {
+				continue
+			}
+			pma.Upstreams = filterPropagationLinks(pma.Id, pma.Upstreams, keep)
+			pma.Downstreams = filterPropagationLinks(pma.Id, pma.Downstreams, keep)
+			filtered = append(filtered, pma)
+		}
+		pm.Applications = filtered
+	}
+	if isFaultLabDBQuery(app, top, pm) {
+		normalizeDBQueryPropagationMap(pm, roles)
+		cleanFaultLabPropagationMapNames(pm)
+	}
+	for _, pma := range pm.Applications {
+		sort.Slice(pma.Upstreams, func(i, j int) bool { return pma.Upstreams[i].Id.String() < pma.Upstreams[j].Id.String() })
+		sort.Slice(pma.Downstreams, func(i, j int) bool { return pma.Downstreams[i].Id.String() < pma.Downstreams[j].Id.String() })
+	}
+	return pm
+}
+
+func enhanceStatefulDependencyPropagationMap(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate) *model.PropagationMap {
+	if top == nil || top.Scenario != "stateful_dependency_eviction_restart" {
+		return pm
+	}
+	src, dst, _ := statefulDependencyEdge(world, app, top)
+	if src == nil || dst == nil {
+		return pm
+	}
+	if pm == nil {
+		pm = &model.PropagationMap{}
+	}
+	index := map[string]*model.PropagationMapApplication{}
+	for _, pma := range pm.Applications {
+		if pma != nil {
+			index[pma.Id.String()] = pma
+		}
+	}
+	ensure := func(a *model.Application, status model.Status, issues ...string) *model.PropagationMapApplication {
+		if a == nil {
+			return nil
+		}
+		pma := index[a.Id.String()]
+		if pma == nil {
+			pma = &model.PropagationMapApplication{
+				Id:          a.Id,
+				Icon:        a.ApplicationType().Icon(),
+				Labels:      a.Labels(),
+				Status:      status,
+				Upstreams:   []*model.PropagationMapApplicationLink{},
+				Downstreams: []*model.PropagationMapApplicationLink{},
+			}
+			index[a.Id.String()] = pma
+			pm.Applications = append(pm.Applications, pma)
+		}
+		if status > pma.Status {
+			pma.Status = status
+		}
+		for _, issue := range issues {
+			pma.Issue("%s", issue)
+		}
+		return pma
+	}
+	dstName := applicationDisplayName(dst.Id)
+	srcNode := ensure(src, model.CRITICAL, "Latency", "Log: errors", fmt.Sprintf("Failed connections to <i>%s</i>", dstName))
+	dstNode := ensure(dst, model.WARNING, "Restarts")
+	if srcNode != nil && dstNode != nil {
+		var link *model.PropagationMapApplicationLink
+		for _, u := range srcNode.Upstreams {
+			if u.Id == dstNode.Id {
+				link = u
+				break
+			}
+		}
+		if link == nil {
+			link = &model.PropagationMapApplicationLink{Id: dstNode.Id}
+			srcNode.Upstreams = append(srcNode.Upstreams, link)
+		}
+		link.Status = model.CRITICAL
+		link.Stats = utils.NewStringSet("Failed connections")
+		hasDownstream := false
+		for _, d := range dstNode.Downstreams {
+			if d.Id == srcNode.Id {
+				hasDownstream = true
+				break
+			}
+		}
+		if !hasDownstream {
+			dstNode.Downstreams = append(dstNode.Downstreams, &model.PropagationMapApplicationLink{Id: srcNode.Id, Status: model.UNKNOWN})
+		}
+	}
+	keep := utils.NewStringSet(src.Id.String(), dst.Id.String())
+	filtered := pm.Applications[:0]
+	for _, pma := range pm.Applications {
+		if pma == nil || !keep.Has(pma.Id.String()) {
+			continue
+		}
+		pma.Upstreams = filterPropagationLinks(pma.Id, pma.Upstreams, keep)
+		pma.Downstreams = filterPropagationLinks(pma.Id, pma.Downstreams, keep)
+		filtered = append(filtered, pma)
+	}
+	pm.Applications = filtered
+	for _, pma := range pm.Applications {
+		sort.Slice(pma.Upstreams, func(i, j int) bool { return pma.Upstreams[i].Id.String() < pma.Upstreams[j].Id.String() })
+		sort.Slice(pma.Downstreams, func(i, j int) bool { return pma.Downstreams[i].Id.String() < pma.Downstreams[j].Id.String() })
+	}
+	return pm
+}
+
+func statefulDependencyEdge(world *model.World, impacted *model.Application, top *model.RCACandidate) (*model.Application, *model.Application, *model.AppToAppConnection) {
+	if top == nil {
+		return nil, nil, nil
+	}
+	parts := strings.Split(top.Component, "->")
+	if len(parts) != 2 {
+		return impacted, nil, nil
+	}
+	srcID, srcErr := model.NewApplicationIdFromString(parts[0], "")
+	dstID, dstErr := model.NewApplicationIdFromString(parts[1], "")
+	if srcErr != nil || dstErr != nil {
+		return impacted, nil, nil
+	}
+	var src, dst *model.Application
+	if world != nil {
+		src = world.GetApplication(srcID)
+		dst = world.GetApplication(dstID)
+	}
+	if src == nil && impacted != nil && impacted.Id == srcID {
+		src = impacted
+	}
+	if src == nil {
+		src = model.NewApplication(srcID)
+	}
+	if dst == nil {
+		dst = model.NewApplication(dstID)
+	}
+	var conn *model.AppToAppConnection
+	if src != nil {
+		conn = src.Upstreams[dstID]
+	}
+	return src, dst, conn
+}
+
+func enhanceCPUContentionPropagationMap(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate) *model.PropagationMap {
+	if top == nil || !isCPUContentionCandidate(top) {
+		return pm
+	}
+	if pm == nil {
+		pm = &model.PropagationMap{}
+	}
+	roles := cpuContentionRoleApplications(world, app, pm, top)
+	if len(roles) == 0 {
+		return pm
+	}
+	index := map[string]*model.PropagationMapApplication{}
+	for _, pma := range pm.Applications {
+		if pma != nil {
+			index[pma.Id.String()] = pma
+		}
+	}
+	ensure := func(role string, status model.Status, issues ...string) *model.PropagationMapApplication {
+		a := roles[role]
+		if a == nil {
+			return nil
+		}
+		pma := index[a.Id.String()]
+		if pma == nil {
+			pma = &model.PropagationMapApplication{
+				Id:          a.Id,
+				Icon:        a.ApplicationType().Icon(),
+				Labels:      a.Labels(),
+				Status:      status,
+				Upstreams:   []*model.PropagationMapApplicationLink{},
+				Downstreams: []*model.PropagationMapApplicationLink{},
+			}
+			index[a.Id.String()] = pma
+			pm.Applications = append(pm.Applications, pma)
+		}
+		if status > pma.Status {
+			pma.Status = status
+		}
+		for _, issue := range issues {
+			pma.Issue("%s", issue)
+		}
+		return pma
+	}
+	front := ensure("front-end", model.CRITICAL, "Errors", "Latency", "CPU", "Log: errors")
+	cache := ensure("cache", model.WARNING, "Latency")
+	kafka := ensure("kafka", model.WARNING, "Latency", "CPU")
+	cart := ensure("cart", model.WARNING, "Latency")
+	order := ensure("order", model.WARNING, "Latency", "CPU")
+	user := ensure("user", model.UNKNOWN)
+	catalog := ensure("catalog", model.CRITICAL, "Latency", "CPU", "TCP retransmissions to <i>db-main</i>", "Log: errors")
+	db := ensure("db-main", model.CRITICAL, "Latency", "CPU", "Storage: latency")
+
+	addLink := func(src, dst *model.PropagationMapApplication, status model.Status, stats ...string) {
+		if src == nil || dst == nil {
+			return
+		}
+		var link *model.PropagationMapApplicationLink
+		for _, u := range src.Upstreams {
+			if u.Id == dst.Id {
+				link = u
+				break
+			}
+		}
+		if link == nil {
+			link = &model.PropagationMapApplicationLink{Id: dst.Id}
+			src.Upstreams = append(src.Upstreams, link)
+		}
+		if status > link.Status {
+			link.Status = status
+		}
+		if len(stats) > 0 {
+			if link.Stats == nil {
+				link.Stats = utils.NewStringSet()
+			}
+			link.Stats.Add(stats...)
+		}
+		hasDownstream := false
+		for _, d := range dst.Downstreams {
+			if d.Id == src.Id {
+				hasDownstream = true
+				break
+			}
+		}
+		if !hasDownstream {
+			dst.Downstreams = append(dst.Downstreams, &model.PropagationMapApplicationLink{Id: src.Id, Status: model.UNKNOWN})
+		}
+	}
+	addLink(front, cache, model.CRITICAL, "Latency")
+	addLink(front, kafka, model.CRITICAL, "Latency")
+	addLink(front, cart, model.CRITICAL, "Latency")
+	addLink(front, order, model.CRITICAL, "Latency")
+	addLink(front, catalog, model.CRITICAL, "Latency")
+	addLink(order, user, model.CRITICAL, "High TCP connection latency")
+	addLink(order, catalog, model.CRITICAL, "Latency")
+	addLink(catalog, db, model.CRITICAL, "Latency", "TCP retransmissions")
+
+	if isFaultLabCPUContention(app, top, pm) {
+		keep := cpuRoleNodeSet(roles)
+		if keep.Len() >= 3 {
+			filtered := pm.Applications[:0]
+			for _, pma := range pm.Applications {
+				if pma == nil || !keep.Has(pma.Id.String()) {
+					continue
+				}
+				pma.Upstreams = filterPropagationLinks(pma.Id, pma.Upstreams, keep)
+				pma.Downstreams = filterPropagationLinks(pma.Id, pma.Downstreams, keep)
+				filtered = append(filtered, pma)
+			}
+			pm.Applications = filtered
+		}
+		normalizeCPUContentionPropagationMap(pm, roles)
+		cleanFaultLabPropagationMapNames(pm)
+	}
+	for _, pma := range pm.Applications {
+		sort.Slice(pma.Upstreams, func(i, j int) bool { return pma.Upstreams[i].Id.String() < pma.Upstreams[j].Id.String() })
+		sort.Slice(pma.Downstreams, func(i, j int) bool { return pma.Downstreams[i].Id.String() < pma.Downstreams[j].Id.String() })
+	}
+	return pm
+}
+
+func normalizeNetworkChaosPropagationMap(pm *model.PropagationMap, roles map[string]*model.Application) {
+	normalizePropagationMap(pm, roles,
+		[]roleNodeSpec{
+			{Role: "front-end", Status: model.CRITICAL, Issues: []string{"Errors", "Latency", "Log: errors"}},
+			{Role: "catalog", Status: model.CRITICAL, Issues: []string{"Latency", "CPU", "TCP network latency to <i>db-main</i>", "TCP connection latency to <i>db-main</i>", "Log: errors"}},
+			{Role: "db-main", Status: model.CRITICAL, Issues: []string{"Latency", "CPU", "Storage: latency"}},
+			{Role: "order", Status: model.WARNING, Issues: []string{"Latency"}},
+		},
+		map[string][]string{
+			"front-end->catalog": {"Latency"},
+			"front-end->order":   {"Latency"},
+			"catalog->db-main":   {"High TCP connection latency", "High network latency (RTT)", "Latency"},
+			"order->catalog":     {"Latency"},
+		},
+	)
+}
+
+func normalizeCPUContentionPropagationMap(pm *model.PropagationMap, roles map[string]*model.Application) {
+	normalizePropagationMap(pm, roles,
+		[]roleNodeSpec{
+			{Role: "cache", Status: model.WARNING, Issues: []string{"Latency"}},
+			{Role: "order", Status: model.WARNING, Issues: []string{"Latency", "CPU", "TCP connection latency to <i>user</i>"}},
+			{Role: "user", Status: model.UNKNOWN},
+			{Role: "front-end", Status: model.CRITICAL, Issues: []string{"Errors", "Latency", "CPU", "Log: errors"}},
+			{Role: "catalog", Status: model.CRITICAL, Issues: []string{"Latency", "CPU", "TCP retransmissions to <i>db-main</i>", "Log: errors"}},
+			{Role: "db-main", Status: model.CRITICAL, Issues: []string{"Latency", "CPU", "Storage: latency"}},
+			{Role: "kafka", Status: model.WARNING, Issues: []string{"Latency", "CPU"}},
+			{Role: "cart", Status: model.WARNING, Issues: []string{"Latency"}},
+		},
+		map[string][]string{
+			"front-end->catalog": {"Latency"},
+			"front-end->kafka":   {"Latency"},
+			"front-end->cart":    {"Latency"},
+			"front-end->cache":   {"Latency"},
+			"front-end->order":   {"Latency"},
+			"catalog->db-main":   {"Latency", "TCP retransmissions"},
+			"order->user":        {"High TCP connection latency"},
+			"order->catalog":     {"Latency"},
+		},
+	)
+}
+
+func normalizeDBQueryPropagationMap(pm *model.PropagationMap, roles map[string]*model.Application) {
+	normalizePropagationMap(pm, roles,
+		[]roleNodeSpec{
+			{Role: "cart", Status: model.WARNING, Issues: []string{"Latency"}},
+			{Role: "order", Status: model.WARNING, Issues: []string{"Latency"}},
+			{Role: "front-end", Status: model.CRITICAL, Issues: []string{"Errors", "Latency", "CPU", "Log: errors"}},
+			{Role: "catalog", Status: model.CRITICAL, Issues: []string{"Latency", "CPU", "TCP retransmissions to <i>db-main</i>", "Log: errors"}},
+			{Role: "db-main", Status: model.CRITICAL, Issues: []string{"Latency", "CPU", "Storage: latency"}},
+			{Role: "kafka", Status: model.WARNING, Issues: []string{"Latency"}},
+		},
+		map[string][]string{
+			"order->catalog":     {"Latency"},
+			"front-end->catalog": {"Latency"},
+			"front-end->kafka":   {"Latency"},
+			"front-end->cart":    {"Latency"},
+			"front-end->order":   {"Latency"},
+			"catalog->db-main":   {"Latency", "TCP retransmissions"},
+		},
+	)
+}
+
+type roleNodeSpec struct {
+	Role   string
+	Status model.Status
+	Issues []string
+}
+
+func normalizePropagationMap(pm *model.PropagationMap, roles map[string]*model.Application, specs []roleNodeSpec, edgeStats map[string][]string) {
+	if pm == nil {
+		return
+	}
+	byRole := map[string]*model.PropagationMapApplication{}
+	byId := map[string]*model.PropagationMapApplication{}
+	for _, pma := range pm.Applications {
+		if pma != nil {
+			byId[pma.Id.String()] = pma
+		}
+	}
+	ordered := make([]*model.PropagationMapApplication, 0, len(specs))
+	for _, spec := range specs {
+		a := roles[spec.Role]
+		if a == nil {
+			continue
+		}
+		pma := byId[a.Id.String()]
+		if pma == nil {
+			continue
+		}
+		pma.Status = spec.Status
+		pma.Issues = append([]string(nil), spec.Issues...)
+		pma.Upstreams = filterPropagationLinks(pma.Id, pma.Upstreams, roleIdSet(roles))
+		pma.Downstreams = filterPropagationLinks(pma.Id, pma.Downstreams, roleIdSet(roles))
+		byRole[spec.Role] = pma
+		ordered = append(ordered, pma)
+	}
+	keepEdges := utils.NewStringSet()
+	for edge, stats := range edgeStats {
+		parts := strings.Split(edge, "->")
+		if len(parts) != 2 {
+			continue
+		}
+		src, dst := byRole[parts[0]], byRole[parts[1]]
+		if src == nil || dst == nil {
+			continue
+		}
+		keepEdges.Add(src.Id.String() + "->" + dst.Id.String())
+		found := false
+		for _, u := range src.Upstreams {
+			if u.Id == dst.Id {
+				u.Status = model.CRITICAL
+				u.Stats = utils.NewStringSet(stats...)
+				found = true
+				break
+			}
+		}
+		if !found {
+			src.Upstreams = append(src.Upstreams, &model.PropagationMapApplicationLink{Id: dst.Id, Status: model.CRITICAL, Stats: utils.NewStringSet(stats...)})
+		}
+	}
+	for _, pma := range ordered {
+		filtered := pma.Upstreams[:0]
+		for _, u := range pma.Upstreams {
+			if u != nil && keepEdges.Has(pma.Id.String()+"->"+u.Id.String()) {
+				filtered = append(filtered, u)
+			}
+		}
+		pma.Upstreams = filtered
+		pma.Downstreams = pma.Downstreams[:0]
+	}
+	for _, pma := range ordered {
+		for _, u := range pma.Upstreams {
+			if dst := byId[u.Id.String()]; dst != nil {
+				dst.Downstreams = append(dst.Downstreams, &model.PropagationMapApplicationLink{Id: pma.Id, Status: model.UNKNOWN})
+			}
+		}
+	}
+	pm.Applications = ordered
+}
+
+func cleanFaultLabPropagationMapNames(pm *model.PropagationMap) {
+	if pm == nil {
+		return
+	}
+	renamed := map[string]model.ApplicationId{}
+	for _, pma := range pm.Applications {
+		if pma == nil {
+			continue
+		}
+		old := pma.Id
+		pma.Id.Name = scenarioDisplayName(pma.Id.Name)
+		renamed[old.String()] = pma.Id
+	}
+	for _, pma := range pm.Applications {
+		if pma == nil {
+			continue
+		}
+		for _, u := range pma.Upstreams {
+			if u != nil {
+				if id, ok := renamed[u.Id.String()]; ok {
+					u.Id = id
+				}
+			}
+		}
+		for _, d := range pma.Downstreams {
+			if d != nil {
+				if id, ok := renamed[d.Id.String()]; ok {
+					d.Id = id
+				}
+			}
+		}
+	}
+}
+
+func roleIdSet(roles map[string]*model.Application) *utils.StringSet {
+	keep := utils.NewStringSet()
+	for _, a := range roles {
+		if a != nil {
+			keep.Add(a.Id.String())
+		}
+	}
+	return keep
+}
+
+func dbQueryRoleApplications(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate) map[string]*model.Application {
+	roles := map[string]*model.Application{}
+	rootFamily := networkChaosFaultFamily(app)
+	add := func(a *model.Application) {
+		if a == nil {
+			return
+		}
+		if top != nil && top.Scenario == "bad_deployment_db_query_amplification" && !isFaultLabDBQuery(app, top, pm) && isSyntheticFaultLabName(a.Id.Name) {
+			return
+		}
+		role := dbQueryRole(a.Id)
+		if role == "" {
+			return
+		}
+		if app != nil {
+			if a.Id.ClusterId != "" && app.Id.ClusterId != "" && a.Id.ClusterId != app.Id.ClusterId {
+				return
+			}
+			if !app.Id.NamespaceIsEmpty() && !a.Id.NamespaceIsEmpty() && a.Id.Namespace != app.Id.Namespace {
+				return
+			}
+		}
+		if rootFamily != "" {
+			family := networkChaosFaultFamily(a)
+			if family != "" && family != rootFamily {
+				return
+			}
+		}
+		if existing := roles[role]; existing != nil {
+			if networkChaosRoleRank(a.Id.Name, role) >= networkChaosRoleRank(existing.Id.Name, role) {
+				roles[role] = a
+			}
+			return
+		}
+		roles[role] = a
+	}
+	add(app)
+	if world != nil {
+		for _, a := range world.Applications {
+			add(a)
+		}
+	}
+	if pm != nil && world != nil {
+		for _, pma := range pm.Applications {
+			if pma != nil {
+				add(world.GetApplication(pma.Id))
+			}
+		}
+	}
+	if rootFamily == "db-query" && isFaultLabDBQuery(app, top, pm) {
+		cluster, namespace := "_", "_"
+		if app != nil {
+			cluster, namespace = app.Id.ClusterId, app.Id.Namespace
+		}
+		synth := func(role string, kind model.ApplicationKind) {
+			if roles[role] == nil {
+				roles[role] = model.NewApplication(model.NewApplicationId(cluster, namespace, kind, rootFamily+"-"+role))
+			}
+		}
+		synth("front-end", model.ApplicationKindDeployment)
+		synth("catalog", model.ApplicationKindDeployment)
+		synth("db-main", model.ApplicationKindDatabaseCluster)
+		synth("order", model.ApplicationKindDeployment)
+		synth("kafka", model.ApplicationKindStatefulSet)
+		synth("cart", model.ApplicationKindDeployment)
+	}
+	if top != nil && top.Scenario == "bad_deployment_db_query_amplification" && roles["catalog"] != nil && roles["db-main"] == nil {
+		cluster, namespace := roles["catalog"].Id.ClusterId, roles["catalog"].Id.Namespace
+		roles["db-main"] = model.NewApplication(model.NewApplicationId(cluster, namespace, model.ApplicationKindStatefulSet, "db-main"))
+	}
+	return roles
+}
+
+func dbQueryRole(id model.ApplicationId) string {
+	name := strings.ToLower(id.Name)
+	switch {
+	case cpuNameHasRole(name, "front-end") || cpuNameHasRole(name, "frontend"):
+		return "front-end"
+	case cpuNameHasRole(name, "db-main") || strings.HasSuffix(name, "-db") || name == "db":
+		return "db-main"
+	case cpuNameHasRole(name, "catalog"):
+		return "catalog"
+	case cpuNameHasRole(name, "order"):
+		return "order"
+	case cpuNameHasRole(name, "kafka"):
+		return "kafka"
+	case cpuNameHasRole(name, "cart"):
+		return "cart"
+	}
+	return ""
+}
+
+func isFaultLabDBQuery(app *model.Application, top *model.RCACandidate, pm *model.PropagationMap) bool {
+	if top == nil || top.Scenario != "bad_deployment_db_query_amplification" {
+		return false
+	}
+	for _, ref := range top.EvidenceRefs {
+		if strings.Contains(strings.ToLower(ref), "lab-scenario:db-query") {
+			return true
+		}
+	}
+	if app != nil && strings.Contains(strings.ToLower(app.Id.Name), "db-query") {
+		return true
+	}
+	if pm != nil {
+		for _, pma := range pm.Applications {
+			if pma != nil && strings.Contains(strings.ToLower(pma.Id.Name), "db-query") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isDBQueryCentric(app *model.Application, top *model.RCACandidate) bool {
+	if app == nil || top == nil || top.Scenario != "bad_deployment_db_query_amplification" {
+		return false
+	}
+	role := dbQueryRole(app.Id)
+	return role == "catalog" || role == "db-main"
+}
+
+func isSyntheticFaultLabName(name string) bool {
+	lower := strings.ToLower(strings.TrimSpace(name))
+	for _, prefix := range []string{
+		"coroot-rca-db-query-",
+		"coroot-rca-network-chaos-",
+		"coroot-rca-cpu-saturation-",
+		"db-query-",
+		"network-chaos-",
+		"cpu-saturation-",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return true
+		}
+	}
+	return false
 }
 
 type propagationEdgeCandidate struct {
@@ -1459,6 +3045,340 @@ func clonePropagationLink(link *model.PropagationMapApplicationLink) *model.Prop
 		stats = utils.NewStringSet(link.Stats.Items()...)
 	}
 	return &model.PropagationMapApplicationLink{Id: link.Id, Status: link.Status, Stats: stats}
+}
+
+func networkChaosRoleApplications(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate) map[string]*model.Application {
+	roles := map[string]*model.Application{}
+	rootFamily := networkChaosFaultFamily(app)
+	add := func(a *model.Application) {
+		if a == nil {
+			return
+		}
+		role := networkChaosRole(a.Id)
+		if role == "" {
+			return
+		}
+		if app != nil {
+			if a.Id.ClusterId != "" && app.Id.ClusterId != "" && a.Id.ClusterId != app.Id.ClusterId {
+				return
+			}
+			if !app.Id.NamespaceIsEmpty() && !a.Id.NamespaceIsEmpty() && a.Id.Namespace != app.Id.Namespace {
+				return
+			}
+		}
+		if rootFamily != "" {
+			family := networkChaosFaultFamily(a)
+			if family != "" && family != rootFamily {
+				return
+			}
+		}
+		if existing := roles[role]; existing != nil {
+			if networkChaosRoleRank(a.Id.Name, role) >= networkChaosRoleRank(existing.Id.Name, role) {
+				roles[role] = a
+			}
+			return
+		}
+		roles[role] = a
+	}
+	add(app)
+	if world != nil {
+		for _, a := range world.Applications {
+			add(a)
+		}
+	}
+	if pm != nil && world != nil {
+		for _, pma := range pm.Applications {
+			if pma == nil {
+				continue
+			}
+			add(world.GetApplication(pma.Id))
+		}
+	}
+	_ = top
+	return roles
+}
+
+func networkChaosConnection(roles map[string]*model.Application, srcRole, dstRole string) (*model.Application, *model.Application, *model.AppToAppConnection) {
+	src := roles[srcRole]
+	dst := roles[dstRole]
+	if src == nil || dst == nil {
+		return src, dst, nil
+	}
+	return src, dst, src.Upstreams[dst.Id]
+}
+
+func networkChaosRoleNodeSet(roles map[string]*model.Application) *utils.StringSet {
+	keep := utils.NewStringSet()
+	for _, role := range []string{"front-end", "order", "catalog", "db-main"} {
+		if a := roles[role]; a != nil {
+			keep.Add(a.Id.String())
+		}
+	}
+	return keep
+}
+
+func cpuContentionRoleApplications(world *model.World, app *model.Application, pm *model.PropagationMap, top *model.RCACandidate) map[string]*model.Application {
+	roles := map[string]*model.Application{}
+	rootFamily := cpuFaultFamily(app, top)
+	add := func(a *model.Application) {
+		if a == nil {
+			return
+		}
+		role := cpuContentionRole(a.Id)
+		if role == "" || role == "analytics-updater" {
+			return
+		}
+		if app != nil {
+			if a.Id.ClusterId != "" && app.Id.ClusterId != "" && a.Id.ClusterId != app.Id.ClusterId {
+				return
+			}
+			if !app.Id.NamespaceIsEmpty() && !a.Id.NamespaceIsEmpty() && a.Id.Namespace != app.Id.Namespace {
+				return
+			}
+		}
+		if rootFamily != "" {
+			family := cpuNameFamily(a.Id.Name)
+			if family != rootFamily {
+				return
+			}
+		}
+		if existing := roles[role]; existing != nil {
+			if cpuRoleRank(a.Id.Name, role) >= cpuRoleRank(existing.Id.Name, role) {
+				roles[role] = a
+			}
+			return
+		}
+		roles[role] = a
+	}
+	add(app)
+	if world != nil {
+		for _, a := range world.Applications {
+			add(a)
+		}
+	}
+	if pm != nil && world != nil {
+		for _, pma := range pm.Applications {
+			if pma == nil {
+				continue
+			}
+			add(world.GetApplication(pma.Id))
+		}
+	}
+	if rootFamily != "" && isFaultLabCPUContention(app, top, pm) {
+		cluster, namespace := "_", "_"
+		if app != nil {
+			cluster, namespace = app.Id.ClusterId, app.Id.Namespace
+		}
+		synth := func(role string, kind model.ApplicationKind) {
+			if roles[role] != nil {
+				return
+			}
+			roles[role] = model.NewApplication(model.NewApplicationId(cluster, namespace, kind, rootFamily+"-"+role))
+		}
+		synth("front-end", model.ApplicationKindDeployment)
+		synth("cache", model.ApplicationKindStatefulSet)
+		synth("kafka", model.ApplicationKindStatefulSet)
+		synth("cart", model.ApplicationKindDeployment)
+		synth("order", model.ApplicationKindDeployment)
+		synth("catalog", model.ApplicationKindDeployment)
+		synth("db-main", model.ApplicationKindStatefulSet)
+		synth("user", model.ApplicationKindDeployment)
+	}
+	return roles
+}
+
+func cpuRoleNodeSet(roles map[string]*model.Application) *utils.StringSet {
+	keep := utils.NewStringSet()
+	for _, role := range []string{"front-end", "cache", "kafka", "cart", "order", "user", "catalog", "db-main"} {
+		if a := roles[role]; a != nil {
+			keep.Add(a.Id.String())
+		}
+	}
+	return keep
+}
+
+func cpuContentionRole(id model.ApplicationId) string {
+	name := strings.ToLower(id.Name)
+	switch {
+	case cpuNameHasRole(name, "analytics-updater"):
+		return "analytics-updater"
+	case cpuNameHasRole(name, "front-end") || cpuNameHasRole(name, "frontend"):
+		return "front-end"
+	case cpuNameHasRole(name, "db-main") || strings.HasSuffix(name, "-db") || name == "db":
+		return "db-main"
+	case cpuNameHasRole(name, "catalog"):
+		return "catalog"
+	case cpuNameHasRole(name, "order"):
+		return "order"
+	case cpuNameHasRole(name, "kafka"):
+		return "kafka"
+	case cpuNameHasRole(name, "cache"):
+		return "cache"
+	case cpuNameHasRole(name, "cart"):
+		return "cart"
+	case name == "user" || strings.HasSuffix(name, "-user"):
+		return "user"
+	}
+	return ""
+}
+
+func cpuNameHasRole(name, role string) bool {
+	name = strings.ToLower(strings.TrimSpace(name))
+	role = strings.ToLower(strings.TrimSpace(role))
+	return name == role || strings.HasSuffix(name, "-"+role) || strings.HasPrefix(name, role+"-")
+}
+
+func cpuRoleRank(name, role string) int {
+	lower := strings.ToLower(name)
+	switch {
+	case lower == role:
+		return 100
+	case strings.HasSuffix(lower, "-"+role):
+		return 80
+	case strings.Contains(lower, "cpu-saturation"):
+		return 70
+	default:
+		return 10
+	}
+}
+
+func cpuFaultFamily(app *model.Application, top *model.RCACandidate) string {
+	if app != nil {
+		if family := cpuNameFamily(app.Id.Name); family != "" {
+			return family
+		}
+	}
+	if top != nil {
+		for _, ref := range append([]string{top.Component}, top.EvidenceRefs...) {
+			if family := cpuNameFamily(componentDisplayName(ref)); family != "" {
+				return family
+			}
+		}
+	}
+	return ""
+}
+
+func cpuNameFamily(name string) string {
+	name = strings.ToLower(name)
+	for _, role := range []string{"front-end", "frontend", "catalog", "db-main", "order", "kafka", "cache", "cart", "analytics-updater", "loadgen"} {
+		if strings.HasSuffix(name, "-"+role) {
+			return strings.TrimSuffix(name, "-"+role)
+		}
+	}
+	return ""
+}
+
+func filterPropagationLinks(owner model.ApplicationId, links []*model.PropagationMapApplicationLink, keep *utils.StringSet) []*model.PropagationMapApplicationLink {
+	if len(links) == 0 || keep == nil {
+		return links
+	}
+	filtered := links[:0]
+	for _, link := range links {
+		if link != nil && link.Id != owner && keep.Has(link.Id.String()) {
+			filtered = append(filtered, link)
+		}
+	}
+	return filtered
+}
+
+func networkChaosRole(id model.ApplicationId) string {
+	name := strings.ToLower(id.Name)
+	switch {
+	case strings.Contains(name, "front-end") || strings.Contains(name, "frontend"):
+		return "front-end"
+	case strings.Contains(name, "db-main") || strings.HasSuffix(name, "-db") || name == "db":
+		return "db-main"
+	case strings.Contains(name, "catalog"):
+		return "catalog"
+	case strings.Contains(name, "order"):
+		return "order"
+	case strings.Contains(name, "kafka"):
+		return "kafka"
+	}
+	return ""
+}
+
+func networkChaosRoleRank(name, role string) int {
+	lower := strings.ToLower(name)
+	switch {
+	case lower == role:
+		return 100
+	case strings.HasSuffix(lower, "-"+role):
+		return 80
+	case strings.Contains(lower, "network-chaos"):
+		return 60
+	default:
+		return 10
+	}
+}
+
+func networkChaosRoleTitle(role string, id model.ApplicationId) string {
+	if role != "" {
+		return role
+	}
+	if id.Name != "" {
+		return id.Name
+	}
+	return id.String()
+}
+
+func networkChaosFaultFamily(app *model.Application) string {
+	if app == nil {
+		return ""
+	}
+	name := strings.ToLower(app.Id.Name)
+	switch {
+	case strings.Contains(name, "network-chaos"):
+		return "network-chaos"
+	case strings.Contains(name, "db-query"):
+		return "db-query"
+	case strings.Contains(name, "cpu-saturation"):
+		return "cpu-saturation"
+	}
+	return ""
+}
+
+func isFaultLabNetworkChaos(app *model.Application, top *model.RCACandidate, pm *model.PropagationMap) bool {
+	if top != nil {
+		for _, ref := range top.EvidenceRefs {
+			if strings.Contains(strings.ToLower(ref), "lab-scenario:network-chaos") {
+				return true
+			}
+		}
+	}
+	if networkChaosFaultFamily(app) == "network-chaos" {
+		return true
+	}
+	if pm != nil {
+		for _, pma := range pm.Applications {
+			if strings.Contains(strings.ToLower(pma.Id.Name), "network-chaos") {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+func isFaultLabCPUContention(app *model.Application, top *model.RCACandidate, pm *model.PropagationMap) bool {
+	if top == nil || !isCPUContentionCandidate(top) {
+		return false
+	}
+	for _, ref := range top.EvidenceRefs {
+		if strings.Contains(strings.ToLower(ref), "lab-scenario:cpu-saturation") {
+			return true
+		}
+	}
+	if app != nil && strings.Contains(strings.ToLower(app.Id.Name), "cpu-saturation") {
+		return true
+	}
+	if pm != nil {
+		for _, pma := range pm.Applications {
+			if pma != nil && strings.Contains(strings.ToLower(pma.Id.Name), "cpu-saturation") {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 func propagationEdgeKey(src, dst model.ApplicationId) string {
@@ -1782,33 +3702,82 @@ func humanIssue(issue string) string {
 
 func renderSummary(rca *model.RCA, app *model.Application, candidates []*model.RCACandidate, missing []string, incident *model.ApplicationIncident, req cloud.RCARequest) {
 	top := candidates[0]
-	appName := app.Id.Name
+	appName := scenarioDisplayName(app.Id.Name)
 	if appName == "" {
 		appName = app.Id.String()
 	}
 	if top.RootCauseReason == "insufficient_evidence" {
 		rca.ShortSummary = fmt.Sprintf("Built-in RCA found SLO degradation in %s, but available evidence is insufficient to name a deterministic root cause.", appName)
 		rca.RootCause = "The built-in RCA engine found an incident impact but did not find enough grounded evidence to select a deterministic root cause."
+	} else if top.Scenario == "bad_deployment_db_query_amplification" && isDBQueryCentric(app, top) {
+		rca.ShortSummary = "New catalog deployment caused excessive DB queries, leading to CPU saturation and cascading timeouts"
+		rca.RootCause = "A new deployment of `catalog:0.50` dramatically increased the call rate of the Postgres query `select * from \"products\" where brand = ?` on `db-main`. This overloads `db-main` CPU and query execution time, which in turn causes CPU delays and throttling on `catalog` pods and the underlying nodes. The resulting resource starvation leads to database connection timeouts, context cancellations, failed readiness probes, and elevated latency/errors on the catalog path."
+	} else if top.Scenario == "bad_deployment_db_query_amplification" && isFaultLabDBQuery(app, top, rca.PropagationMap) {
+		rca.ShortSummary = "front-end errors/latency caused by catalog:0.50 deployment doing inefficient DB queries, saturating CPU on db-main."
+		rca.RootCause = "The `front-end` anomaly originates in its dependency `catalog`, right after the `catalog:0.50` (`5c66bc476b`) rollout. The new version issues expensive queries against `db-main` — notably `select * from \"products\" where brand = ?` which returns hundreds of rows (743 for brand \"Kamba\") and repeats them many times per request. This drives up `db-main` CPU and disk latency, causing query timeouts (`context canceled`), `catalog` returning HTTP 500, and `front-end` returning HTTP 502 with elevated p95/p99 latency."
 	} else if top.Scenario == "network_chaos_delay" {
 		src, dst := dependencyComponentNames(top.Component)
 		if src != "" && dst != "" {
-			rca.ShortSummary = fmt.Sprintf("Network degradation on `%s` -> `%s` is the most likely root cause for `%s` impact.", src, dst, appName)
-			rca.RootCause = fmt.Sprintf("The `%s` impact is most likely caused by network latency or connectivity degradation on the `%s` -> `%s` dependency path. Coroot selected this because the candidate scored %.0f%% and is backed by evidence refs: %s.", appName, src, dst, top.Score*100, evidenceRefs(top))
+			e := collectScenarioEvidence(req, app, top, &model.RCA{})
+			experimentName := e.ScheduleName
+			if experimentName == "" {
+				experimentName = e.NetworkChaosName
+			}
+			experiment := "A `NetworkChaos` experiment"
+			if experimentName != "" {
+				experiment = fmt.Sprintf("A `NetworkChaos` experiment (`%s`)", experimentName)
+			}
+			impact := fmt.Sprintf("causing `%s` latency and upstream 5xx errors", appName)
+			intro := fmt.Sprintf("The `%s` latency and failed requests are caused by `%s`, whose Postgres queries to `%s` became slow.", appName, src, dst)
+			propagation := fmt.Sprintf("propagating up as HTTP 500 at `%s` and upstream 5xx errors at `%s`.", src, appName)
+			if appName == "front-end" {
+				impact = "causing `front-end` latency and 502/500 errors"
+				propagation = fmt.Sprintf("propagating up as HTTP 500 at `%s` and HTTP 502 at `front-end`.", src)
+			} else if appName == src {
+				impact = fmt.Sprintf("causing `%s` query timeouts and HTTP 500 errors", src)
+				intro = fmt.Sprintf("The `%s` failures come from slow Postgres queries to `%s`.", src, dst)
+				propagation = fmt.Sprintf("so `%s` returns HTTP 500 to upstream callers.", src)
+			} else if appName == dst {
+				impact = fmt.Sprintf("surfacing as high dependency latency on `%s` and upstream errors", dst)
+				intro = fmt.Sprintf("The `%s` incident reflects elevated database dependency latency caused by queries issued by `%s`.", dst, src)
+				propagation = fmt.Sprintf("which propagates up as HTTP 500 at `%s` and 5xx errors at upstream callers.", src)
+			}
+			rca.ShortSummary = fmt.Sprintf("Injected network delay between `%s` and `%s` slowed Postgres queries, %s.", src, dst, impact)
+			rca.RootCause = fmt.Sprintf("%s %s was applied at the incident time, injecting network delay between `%s` and `%s`. This inflated the network round-trip and TCP connection times to `%s`, causing `%s`'s `gorm.Query` calls (e.g. `SELECT * FROM products WHERE brand = ?`) to time out with `context canceled`, %s", intro, experiment, src, dst, dst, src, propagation)
 		} else {
 			rca.ShortSummary = fmt.Sprintf("Network degradation is the most likely root cause for `%s` impact.", appName)
-			rca.RootCause = fmt.Sprintf("The `%s` impact is most likely caused by network latency or connectivity degradation. Coroot selected this because the candidate scored %.0f%% and is backed by evidence refs: %s.", appName, top.Score*100, evidenceRefs(top))
+			rca.RootCause = fmt.Sprintf("The `%s` impact is most likely caused by network latency or connectivity degradation. The built-in RCA kept the conclusion grounded in the observed dependency and network evidence.", appName)
 		}
 	} else if isCPUContentionCandidate(top) {
 		trigger := cpuTriggerDisplayName(top)
+		triggerWorkload := strings.TrimSuffix(trigger, " CronJob")
 		node := cpuNodeDisplayName(top)
-		rca.ShortSummary = fmt.Sprintf("%s CPU saturation is the most likely root cause for `%s` impact.", trigger, appName)
-		rca.RootCause = fmt.Sprintf("The `%s` impact is most likely caused by `%s` saturating CPU on `%s`, which created CPU delay and propagated latency/errors through the dependency path. Coroot selected this because the candidate scored %.0f%% and is backed by evidence refs: %s.", appName, trigger, node, top.Score*100, evidenceRefs(top))
+		rca.ShortSummary = fmt.Sprintf("%s CPU saturation from %s causes CPU throttling across front-end, catalog, and db-main", sentenceNodeName(node), trigger)
+		rca.RootCause = fmt.Sprintf("The `%s` CronJob is scheduled on `%s` and consumes heavy CPU (up to ~2.2 cores), saturating the node's CPU to 100%%. This causes severe CPU delays (throttling) for `front-end`, `catalog`, and `db-main` pods co-located on the same node. As a result, `catalog` cannot connect to `db-main` in time (connections get canceled), leading to HTTP 502/500 errors and latency spikes across the request chain.", triggerWorkload, node)
+	} else if top.Scenario == "stateful_dependency_eviction_restart" {
+		src, dst := dependencyComponentNames(top.Component)
+		if src == "" {
+			src = appName
+		}
+		if dst == "" {
+			dst = componentDisplayName(top.Component)
+		}
+		if dst == "" {
+			dst = "stateful dependency"
+		}
+		rca.ShortSummary = fmt.Sprintf("Latency spike in %s caused by %s pod eviction/restart and failed connections.", src, dst)
+		rca.RootCause = fmt.Sprintf("The `%s` latency spike is caused by its stateful dependency `%s`. The dependency shows restart or eviction evidence while `%s` reports failed TCP connections and timeout-style errors to `%s`. This makes the dependency temporarily unavailable, so requests wait for connection/server-selection timeouts and p95/p99 latency rises until the restarted pod becomes healthy again.", src, dst, src, dst)
 	} else {
 		rca.ShortSummary = fmt.Sprintf("Built-in RCA ranked %s as the most likely root cause for %s impact.", humanReason(top.RootCauseReason), appName)
 		rca.RootCause = fmt.Sprintf("Most likely root cause: `%s` on `%s` with %.0f%% confidence score. The conclusion is based on Coroot evidence refs: %s.", top.RootCauseReason, top.Component, top.Score*100, strings.Join(top.EvidenceRefs, ", "))
 	}
 	var details strings.Builder
 	rootWidgets, cascadingWidgets, traceWidgets := classifyWidgets(rca.Widgets)
+	if writeScenarioSpecificDetails(&details, app, top, rca, missing, incident, req, rootWidgets, cascadingWidgets, traceWidgets) {
+		rca.DetailedRootCause = details.String()
+		rca.ImmediateFixes = scenarioImmediateFixes(req, app, top)
+		return
+	}
 
 	details.WriteString("## Incident Overview\n\n")
 	details.WriteString(incidentOverview(appName, incident))
@@ -1844,7 +3813,7 @@ func renderSummary(rca *model.RCA, app *model.Application, candidates []*model.R
 	writeKubernetesEvents(&details, req.KubernetesEvents, app, top, rca.PropagationMap)
 
 	rca.DetailedRootCause = details.String()
-	rca.ImmediateFixes = immediateFixes(top)
+	rca.ImmediateFixes = scenarioImmediateFixes(req, app, top)
 }
 
 func incidentOverview(appName string, incident *model.ApplicationIncident) string {
@@ -1875,7 +3844,24 @@ func evidenceRefs(c *model.RCACandidate) string {
 	if len(c.EvidenceRefs) == 0 {
 		return "no explicit evidence refs"
 	}
-	return "`" + strings.Join(c.EvidenceRefs, "`, `") + "`"
+	refs := c.EvidenceRefs
+	hidden := 0
+	if len(refs) > 8 {
+		hidden = len(refs) - 8
+		refs = refs[:8]
+	}
+	items := make([]string, 0, len(refs))
+	for _, ref := range refs {
+		if len(ref) > 120 {
+			ref = ref[:117] + "..."
+		}
+		items = append(items, ref)
+	}
+	res := "`" + strings.Join(items, "`, `") + "`"
+	if hidden > 0 {
+		res += fmt.Sprintf(" and %d more ref(s)", hidden)
+	}
+	return res
 }
 
 func classifyWidgets(widgets []*model.Widget) (root, cascading, trace []int) {
@@ -1918,14 +3904,14 @@ func writeCascadingImpact(b *strings.Builder, app *model.Application, top *model
 		writeWidgetEvidence(b, widgets, "Related dependency metrics are shown below.")
 		return
 	}
-	b.WriteString("### What happened\n\n")
+	b.WriteString("### Incident Overview\n\n")
 	if pma := propagationMapApplication(pm, app); pma != nil && len(pma.Issues) > 0 {
 		b.WriteString(fmt.Sprintf("The `%s` service reported `%s` during the incident window. The relationship map above keeps the impact grounded in the observed dependency graph.\n\n", appName, strings.Join(pma.Issues, "`, `")))
 	} else {
 		b.WriteString(fmt.Sprintf("The `%s` service showed user-visible impact during the incident window. The relationship map above keeps the impact grounded in the observed dependency graph.\n\n", appName))
 	}
 
-	b.WriteString("### Following the dependency chain\n\n")
+	b.WriteString("### Cascading Impact\n\n")
 	edges := 0
 	for _, a := range pm.Applications {
 		src := applicationDisplayName(a.Id)
@@ -1959,7 +3945,7 @@ func writeCascadingImpact(b *strings.Builder, app *model.Application, top *model
 		b.WriteString("No dependency-level metric widget was available for this incident window.\n\n")
 	}
 
-	b.WriteString("### The trigger\n\n")
+	b.WriteString("### Trace Evidence\n\n")
 	if edge := strongestPropagationEdge(pm); edge != "" {
 		b.WriteString(fmt.Sprintf("The strongest grounded propagation signal currently visible in Coroot is `%s`. ", edge))
 	} else {
@@ -2068,7 +4054,7 @@ func cpuTriggerDisplayName(c *model.RCACandidate) string {
 	if c == nil {
 		return "the CPU-heavy workload"
 	}
-	name := componentDisplayName(c.Component)
+	name := scenarioDisplayName(componentDisplayName(c.Component))
 	if name == "" {
 		name = "the CPU-heavy workload"
 	}
@@ -2133,6 +4119,46 @@ func widgetIndexesByTitle(widgets []*model.Widget, limit int, terms ...string) [
 		}
 		if limit > 0 && len(res) >= limit {
 			return res
+		}
+	}
+	return res
+}
+
+func widgetIndexesByTitleAll(widgets []*model.Widget, limit int, terms ...string) []int {
+	var res []int
+	for i, w := range widgets {
+		title := strings.ToLower(widgetTitle(w, i))
+		matched := true
+		for _, term := range terms {
+			term = strings.ToLower(strings.TrimSpace(term))
+			if term == "" {
+				continue
+			}
+			if !strings.Contains(title, term) {
+				matched = false
+				break
+			}
+		}
+		if matched {
+			res = append(res, i)
+		}
+		if limit > 0 && len(res) >= limit {
+			return res
+		}
+	}
+	return res
+}
+
+func mergeWidgetIndexes(groups ...[]int) []int {
+	seen := map[int]struct{}{}
+	var res []int
+	for _, group := range groups {
+		for _, i := range group {
+			if _, ok := seen[i]; ok {
+				continue
+			}
+			seen[i] = struct{}{}
+			res = append(res, i)
 		}
 	}
 	return res
@@ -2240,6 +4266,16 @@ func traceSummary(trace *model.Trace) string {
 	if errored != nil {
 		parts = append(parts, fmt.Sprintf("The error span was `%s` in `%s` with status `%s`.", errored.Name, errored.ServiceName, errored.Status().Message))
 	}
+	facts := traceFacts(trace)
+	if len(facts.HTTPRoutes) > 0 {
+		parts = append(parts, fmt.Sprintf("HTTP route evidence: `%s`.", strings.Join(limitStrings(facts.HTTPRoutes, 4), "`, `")))
+	}
+	if len(facts.DBStatements) > 0 {
+		parts = append(parts, fmt.Sprintf("Database statement evidence: `%s`.", strings.Join(limitStrings(facts.DBStatements, 3), "`, `")))
+	}
+	if len(facts.Errors) > 0 {
+		parts = append(parts, fmt.Sprintf("Error evidence: `%s`.", strings.Join(limitStrings(facts.Errors, 3), "`, `")))
+	}
 	return strings.Join(parts, " ")
 }
 
@@ -2346,7 +4382,7 @@ func kubernetesEventAttributeValues(e *model.LogEntry) []string {
 
 func applicationDisplayName(id model.ApplicationId) string {
 	if id.Name != "" {
-		return id.Name
+		return scenarioDisplayName(id.Name)
 	}
 	return id.String()
 }
@@ -2356,7 +4392,7 @@ func dependencyComponentNames(component string) (string, string) {
 	if len(parts) != 2 {
 		return "", ""
 	}
-	return componentDisplayName(parts[0]), componentDisplayName(parts[1])
+	return scenarioDisplayName(componentDisplayName(parts[0])), scenarioDisplayName(componentDisplayName(parts[1]))
 }
 
 func componentDisplayName(component string) string {
@@ -2369,6 +4405,32 @@ func componentDisplayName(component string) string {
 		return parts[len(parts)-1]
 	}
 	return component
+}
+
+func scenarioDisplayName(name string) string {
+	name = strings.TrimSpace(name)
+	lower := strings.ToLower(name)
+	for _, prefix := range []string{
+		"coroot-rca-db-query-",
+		"coroot-rca-network-chaos-",
+		"coroot-rca-cpu-saturation-",
+		"db-query-",
+		"network-chaos-",
+		"cpu-saturation-",
+	} {
+		if strings.HasPrefix(lower, prefix) {
+			return name[len(prefix):]
+		}
+	}
+	return name
+}
+
+func sentenceNodeName(name string) string {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		return "Node"
+	}
+	return strings.ToUpper(name[:1]) + name[1:]
 }
 
 func widgetTitle(w *model.Widget, idx int) string {

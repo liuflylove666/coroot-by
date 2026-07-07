@@ -220,6 +220,14 @@ func hasLink(links []*model.PropagationMapApplicationLink, id model.ApplicationI
 	return false
 }
 
+func widgetTitlesForTest(widgets []*model.Widget) string {
+	var titles []string
+	for i, w := range widgets {
+		titles = append(titles, widgetTitle(w, i))
+	}
+	return strings.Join(titles, "\n")
+}
+
 func linkHasStats(links []*model.PropagationMapApplicationLink, id model.ApplicationId) bool {
 	for _, link := range links {
 		if link.Id == id {
@@ -285,9 +293,9 @@ func TestDemoReferenceFixtureBuildsNetworkDelayCascade(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"## What happened",
-		"## Following the dependency chain",
-		"## The trigger",
+		"## Incident Overview",
+		"## Cascading Impact",
+		"## Trace Evidence",
 		"NetworkChaos experiment `net-delay-catalog-pg-bwpfn`",
 		"WIDGET-3",
 	} {
@@ -326,6 +334,122 @@ func TestDemoReferenceFixtureBuildsNetworkDelayCascade(t *testing.T) {
 	}
 	if rca.Grounding.Status != "unsafe" || !hasString(rca.Grounding.Issues, "destructive kubectl command requires human approval") {
 		t.Fatalf("expected official delete command to require human review, got %+v", rca.Grounding)
+	}
+}
+
+func TestPostProcessAnnotatesCompetingHypothesis(t *testing.T) {
+	top := &model.RCACandidate{
+		Id:              "c-network",
+		Component:       "test:default:Deployment:catalog",
+		RootCauseReason: "network_chaos_delay",
+		Scenario:        "network_chaos_delay",
+		Score:           0.93,
+		EvidenceRefs:    []string{"k8s-event:networkchaos/net-delay-catalog-pg", "edge:catalog->db-main"},
+	}
+	alt := &model.RCACandidate{
+		Id:              "c-db-query",
+		Component:       "test:default:Deployment:catalog",
+		RootCauseReason: "bad_deployment_db_query_amplification",
+		Scenario:        "bad_deployment_db_query_amplification",
+		Score:           0.88,
+		EvidenceRefs:    []string{"trace:db_statement:select-from-recommendations", "deployment:catalog"},
+	}
+	rca := &model.RCA{
+		RootCause:         "network_chaos_delay on catalog",
+		DetailedRootCause: "network_chaos_delay evidence points to catalog before db-main latency.",
+		ImmediateFixes:    "Verify the NetworkChaos evidence before changing production.",
+		Candidates:        []*model.RCACandidate{top, alt},
+		Trajectory: []model.RCATrajectory{
+			{Step: 1, Tool: "score_candidates", EvidenceRefs: []string{"k8s-event:networkchaos/net-delay-catalog-pg"}, EvidenceChain: []string{"k8s-event:networkchaos/net-delay-catalog-pg"}},
+		},
+	}
+	rootBefore := rca.RootCause
+
+	PostProcess(rca)
+
+	if rca.RootCause != rootBefore {
+		t.Fatalf("competing hypothesis annotation must not rewrite visible root cause: %q", rca.RootCause)
+	}
+	if !hasString(top.SupportingEvidence, "winner_margin:0.05") {
+		t.Fatalf("expected winner margin supporting evidence: %+v", top.SupportingEvidence)
+	}
+	foundAlternative := false
+	for _, e := range top.ContradictingEvidence {
+		if strings.Contains(e, "alternative:bad_deployment_db_query_amplification") && strings.Contains(e, "score=0.88") {
+			foundAlternative = true
+			break
+		}
+	}
+	if !foundAlternative {
+		t.Fatalf("expected close competing hypothesis in contradicting evidence: %+v", top.ContradictingEvidence)
+	}
+	var comparison *model.RCATrajectory
+	for i := range rca.Trajectory {
+		if rca.Trajectory[i].Tool == "compare_competing_hypotheses" {
+			comparison = &rca.Trajectory[i]
+			break
+		}
+	}
+	if comparison == nil {
+		t.Fatalf("expected trajectory to include competing hypothesis comparison: %+v", rca.Trajectory)
+	}
+	for _, want := range []string{"k8s-event:networkchaos/net-delay-catalog-pg", "trace:db_statement:select-from-recommendations"} {
+		if !hasString(comparison.EvidenceChain, want) {
+			t.Fatalf("expected comparison evidence chain to include %q: %+v", want, comparison.EvidenceChain)
+		}
+	}
+
+	PostProcess(rca)
+	count := 0
+	for _, step := range rca.Trajectory {
+		if step.Tool == "compare_competing_hypotheses" {
+			count++
+		}
+	}
+	if count != 1 {
+		t.Fatalf("competing hypothesis annotation must be idempotent, got %d comparison steps", count)
+	}
+}
+
+func TestPostProcessAuditsSingleCandidateConfidence(t *testing.T) {
+	top := &model.RCACandidate{
+		Id:              "c-network",
+		Component:       "test:default:Deployment:catalog",
+		RootCauseReason: "network_chaos_delay",
+		Scenario:        "network_chaos_delay",
+		Score:           0.93,
+		Confidence:      "high",
+		EvidenceRefs:    []string{"k8s-event:networkchaos/net-delay-catalog-pg", "edge:catalog->db-main"},
+	}
+	rca := &model.RCA{
+		RootCause:         "network_chaos_delay on catalog",
+		DetailedRootCause: "network_chaos_delay evidence points to catalog before db-main latency.",
+		ImmediateFixes:    "Verify the NetworkChaos evidence before changing production.",
+		Candidates:        []*model.RCACandidate{top},
+		Trajectory: []model.RCATrajectory{
+			{Step: 1, Tool: "score_candidates", EvidenceRefs: []string{"k8s-event:networkchaos/net-delay-catalog-pg"}, EvidenceChain: []string{"k8s-event:networkchaos/net-delay-catalog-pg"}},
+		},
+	}
+
+	PostProcess(rca)
+
+	if !hasString(top.SupportingEvidence, "candidate_audit:single_candidate") {
+		t.Fatalf("expected single-candidate audit supporting evidence: %+v", top.SupportingEvidence)
+	}
+	var audit *model.RCATrajectory
+	for i := range rca.Trajectory {
+		if rca.Trajectory[i].Tool == "audit_candidate_confidence" {
+			audit = &rca.Trajectory[i]
+			break
+		}
+	}
+	if audit == nil {
+		t.Fatalf("expected confidence audit trajectory step: %+v", rca.Trajectory)
+	}
+	for _, want := range top.EvidenceRefs {
+		if !hasString(audit.EvidenceChain, want) {
+			t.Fatalf("expected confidence audit evidence chain to include %q: %+v", want, audit.EvidenceChain)
+		}
 	}
 }
 
@@ -490,9 +614,9 @@ func TestProductionCronJobCPUContentionCandidateAndDetails(t *testing.T) {
 	}
 	renderSummary(rca, front, []*model.RCACandidate{cpu}, nil, &model.ApplicationIncident{ApplicationId: front.Id, Key: "cpu", OpenedAt: timeseries.Time(1000), Severity: model.CRITICAL}, req)
 	for _, want := range []string{
-		"### Overview",
-		"### CPU saturation on node3",
-		"### Cascading impact on the request path",
+		"## Incident Overview",
+		"## CPU saturation on node3",
+		"## Cascading Impact",
 		"### The analytics-updater CronJob is the trigger",
 		"WIDGET-2",
 		"WIDGET-6",
@@ -500,6 +624,546 @@ func TestProductionCronJobCPUContentionCandidateAndDetails(t *testing.T) {
 		if !strings.Contains(rca.DetailedRootCause, want) {
 			t.Fatalf("expected detailed RCA to contain %q:\n%s", want, rca.DetailedRootCause)
 		}
+	}
+}
+
+func TestProductionDBQueryDeploymentCandidateAndScenarioRenderer(t *testing.T) {
+	ctx := timeseries.NewContext(0, 3600, timeseries.Minute)
+	front := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "front-end"))
+	front.Status = model.CRITICAL
+	catalog := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog"))
+	db := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindStatefulSet, "db-main"))
+	db.Status = model.WARNING
+	catalog.Deployments = []*model.ApplicationDeployment{
+		{
+			ApplicationId: catalog.Id,
+			Name:          "catalog-5c66bc476b",
+			StartedAt:     timeseries.Time(1200),
+			Details:       &model.ApplicationDeploymentDetails{ContainerImages: []string{"catalog:0.50"}},
+		},
+	}
+	front.Upstreams[catalog.Id] = &model.AppToAppConnection{Application: front, RemoteApplication: catalog}
+	catalog.Downstreams[front.Id] = front.Upstreams[catalog.Id]
+	catalog.Upstreams[db.Id] = &model.AppToAppConnection{Application: catalog, RemoteApplication: db, Rtt: testSeries(0.8)}
+	db.Downstreams[catalog.Id] = catalog.Upstreams[db.Id]
+
+	req := cloud.RCARequest{
+		ApplicationId: front.Id,
+		Ctx:           ctx,
+		ErrorTrace:    testDBTrace(),
+		KubernetesEvents: []*model.LogEntry{
+			{Body: "Scaled up ReplicaSet catalog-5c66bc476b for Deployment catalog; readiness probe failed for catalog-5c66bc476b-abcde"},
+		},
+	}
+	candidates := buildCandidates(req, nil, front)
+	var deployment *model.RCACandidate
+	for _, c := range candidates {
+		if c.Scenario == "bad_deployment_db_query_amplification" && strings.Contains(c.Component, "catalog") {
+			deployment = c
+			break
+		}
+	}
+	if deployment == nil {
+		t.Fatalf("expected upstream catalog deployment DB amplification candidate, got %+v", candidates)
+	}
+	if !hasString(deployment.EvidenceRefs, "trace:db_statement:"+evidenceSlug(`select * from "products" where brand = ?`)) {
+		t.Fatalf("expected DB statement evidence ref in %+v", deployment.EvidenceRefs)
+	}
+
+	rca := &model.RCA{
+		Status:         "OK",
+		PropagationMap: propagationMap(front, nil),
+		Widgets: []*model.Widget{
+			{Chart: model.NewChart(ctx, "Latency, seconds")},
+			{Chart: model.NewChart(ctx, "Postgres queries by total time")},
+			{Chart: model.NewChart(ctx, "Latency <i>catalog</i> ↔ <i>db-main</i>, seconds")},
+		},
+		Candidates: []*model.RCACandidate{deployment},
+	}
+	renderSummary(rca, front, []*model.RCACandidate{deployment}, nil, &model.ApplicationIncident{ApplicationId: front.Id, Key: "dbq", OpenedAt: timeseries.Time(1000), Severity: model.CRITICAL}, req)
+	for _, want := range []string{
+		"## Cascading Impact",
+		"## Trace Evidence",
+		`select * from "products" where brand = ?`,
+		"kubectl -n default rollout undo deployment/catalog",
+	} {
+		if !strings.Contains(rca.DetailedRootCause+"\n"+rca.ImmediateFixes, want) {
+			t.Fatalf("expected DB renderer to contain %q:\n%s\nFIXES:\n%s", want, rca.DetailedRootCause, rca.ImmediateFixes)
+		}
+	}
+}
+
+func TestProductionNetworkChaosRendererGeneratesEvidenceCommand(t *testing.T) {
+	ctx := timeseries.NewContext(0, 3600, timeseries.Minute)
+	front := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "front-end"))
+	catalog := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog"))
+	db := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindStatefulSet, "db-main"))
+	front.Upstreams[catalog.Id] = &model.AppToAppConnection{Application: front, RemoteApplication: catalog}
+	catalog.Downstreams[front.Id] = front.Upstreams[catalog.Id]
+	catalog.Upstreams[db.Id] = &model.AppToAppConnection{Application: catalog, RemoteApplication: db, Rtt: testSeries(0.8), SuccessfulConnections: testSeries(10), ConnectionTime: testSeries(3)}
+	db.Downstreams[catalog.Id] = catalog.Upstreams[db.Id]
+
+	top := &model.RCACandidate{
+		Id:              "h-001",
+		Component:       catalog.Id.String() + "->" + db.Id.String(),
+		ComponentType:   "dependency",
+		RootCauseReason: "network_connectivity_or_latency",
+		Scenario:        "network_chaos_delay",
+		Score:           0.91,
+		Confidence:      "high",
+		EvidenceRefs:    []string{"link:" + catalog.Id.String() + "->" + db.Id.String(), "k8s:event"},
+		PyRCAScores:     &model.PyRCAScores{Combined: 0.92},
+	}
+	req := cloud.RCARequest{
+		ApplicationId: front.Id,
+		Ctx:           ctx,
+		ErrorTrace:    testDBTrace(),
+		KubernetesEvents: []*model.LogEntry{
+			{Body: "NetworkChaos net-delay-catalog-pg-bwpfn from Schedule net-delay-catalog-pg applied to catalog and db-main"},
+		},
+	}
+	rca := &model.RCA{
+		Status:         "OK",
+		PropagationMap: propagationMap(front, nil),
+		Widgets: []*model.Widget{
+			{Chart: model.NewChart(ctx, "Network RTT <i>catalog</i> ↔ <i>db-main</i>, seconds")},
+		},
+		Candidates: []*model.RCACandidate{top},
+	}
+	renderSummary(rca, front, []*model.RCACandidate{top}, nil, &model.ApplicationIncident{ApplicationId: front.Id, Key: "net", OpenedAt: timeseries.Time(1000), Severity: model.CRITICAL}, req)
+	for _, want := range []string{
+		"## Incident Overview",
+		"## Cascading Impact",
+		"## Trace Evidence",
+		"`gorm.Query`",
+		"NetworkChaos `net-delay-catalog-pg-bwpfn`",
+		"kubectl delete networkchaos net-delay-catalog-pg-bwpfn -n default",
+		"kubectl delete schedule net-delay-catalog-pg -n default",
+	} {
+		if !strings.Contains(rca.DetailedRootCause+"\n"+rca.ImmediateFixes, want) {
+			t.Fatalf("expected network renderer to contain %q:\n%s\nFIXES:\n%s", want, rca.DetailedRootCause, rca.ImmediateFixes)
+		}
+	}
+}
+
+func TestStatefulDependencyEvictionRendererMatchesOfficialShape(t *testing.T) {
+	world := model.NewWorld(0, 3600, timeseries.Minute, timeseries.Minute)
+	agent := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "coroot-cluster-agent"))
+	mongo := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindStatefulSet, "order-db-mongodb"))
+	agent.Status = model.CRITICAL
+	mongo.Status = model.WARNING
+	agent.Reports = []*model.AuditReport{{
+		Name:   model.AuditReportSLO,
+		Status: model.CRITICAL,
+		Checks: []*model.Check{
+			{Id: model.Checks.SLOLatency.Id, Title: "Latency", Status: model.CRITICAL},
+			{Id: model.Checks.LogErrors.Id, Title: "Log errors", Status: model.WARNING},
+		},
+	}}
+	mongo.Reports = []*model.AuditReport{{
+		Name:   model.AuditReportInstances,
+		Status: model.WARNING,
+		Checks: []*model.Check{
+			{Id: model.Checks.InstanceRestarts.Id, Title: "Restarts", Status: model.WARNING, Message: "order-db-arbiter-0 restarted after eviction"},
+		},
+	}}
+	conn := &model.AppToAppConnection{
+		Application:           agent,
+		RemoteApplication:     mongo,
+		Rtt:                   testSeries(0.001),
+		SuccessfulConnections: testSeries(1),
+		FailedConnections:     testSeries(5),
+		ConnectionTime:        testSeries(0.05),
+	}
+	agent.Upstreams[mongo.Id] = conn
+	mongo.Downstreams[agent.Id] = conn
+	world.Applications[agent.Id] = agent
+	world.Applications[mongo.Id] = mongo
+	req := cloud.RCARequest{
+		ApplicationId: agent.Id,
+		Ctx:           world.Ctx,
+		KubernetesEvents: []*model.LogEntry{
+			{Body: "Pod order-db-arbiter-0 was Evicted because ephemeral local storage usage exceeded the 2Gi limit"},
+		},
+	}
+	incident := &model.ApplicationIncident{ApplicationId: agent.Id, Key: "mongo", OpenedAt: timeseries.Time(1000), Severity: model.CRITICAL}
+
+	rca := BuiltIn(req, world, incident)
+	if rca.Status != "OK" || len(rca.Candidates) == 0 {
+		t.Fatalf("expected built-in RCA result, got %+v", rca)
+	}
+	if rca.Candidates[0].Scenario != "stateful_dependency_eviction_restart" {
+		t.Fatalf("expected stateful dependency scenario to outrank network, got %+v", rca.Candidates[0])
+	}
+	if !strings.Contains(rca.ShortSummary, "order-db-mongodb pod eviction/restart") {
+		t.Fatalf("expected official-like summary, got %q", rca.ShortSummary)
+	}
+	for _, want := range []string{
+		"## Incident Overview",
+		"## Why it happened",
+		"## Cascading Impact",
+		"## Trace Evidence",
+		"kubectl -n default patch statefulset order-db-arbiter",
+		"Failed TCP connection coroot-cluster-agent ↔ order-db-mongodb",
+		"Restarts of order-db-mongodb",
+		"Top collections by size",
+	} {
+		if !strings.Contains(rca.DetailedRootCause+"\n"+rca.ImmediateFixes+"\n"+widgetTitlesForTest(rca.Widgets), want) {
+			t.Fatalf("expected stateful dependency RCA to contain %q:\nDETAILS:\n%s\nFIX:\n%s\nWIDGETS:\n%s", want, rca.DetailedRootCause, rca.ImmediateFixes, widgetTitlesForTest(rca.Widgets))
+		}
+	}
+	apps := map[string]*model.PropagationMapApplication{}
+	for _, a := range rca.PropagationMap.Applications {
+		apps[applicationDisplayName(a.Id)] = a
+	}
+	if len(apps) != 2 || apps["coroot-cluster-agent"] == nil || apps["order-db-mongodb"] == nil {
+		t.Fatalf("expected two-node propagation map, got %+v", rca.PropagationMap.Applications)
+	}
+	if !hasLink(apps["coroot-cluster-agent"].Upstreams, mongo.Id, "Failed connections") {
+		t.Fatalf("expected failed-connections edge, got %+v", apps["coroot-cluster-agent"].Upstreams)
+	}
+}
+
+func TestDBQueryCentricRendererMatchesOfficialVariant(t *testing.T) {
+	world := model.NewWorld(0, 3600, timeseries.Minute, timeseries.Minute)
+	catalog := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog"))
+	catalog.Status = model.CRITICAL
+	catalog.Reports = []*model.AuditReport{{
+		Name:   model.AuditReportLogs,
+		Status: model.CRITICAL,
+		Checks: []*model.Check{
+			{Id: model.Checks.LogErrors.Id, Title: "Log errors", Status: model.CRITICAL, Message: "742 errors occurred"},
+		},
+	}}
+	catalog.LogMessages[model.SeverityError] = &model.LogMessages{Patterns: map[string]*model.LogPattern{
+		"sql": {Sample: `ERROR catalog request failed status=500 elapsed_ms=15595 error=context canceled statement=select * from "products" where brand = ?`},
+	}}
+	other := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "coroot-rca-network-chaos-db-main"))
+	world.Applications[catalog.Id] = catalog
+	world.Applications[other.Id] = other
+	req := cloud.RCARequest{ApplicationId: catalog.Id, Ctx: world.Ctx}
+	incident := &model.ApplicationIncident{ApplicationId: catalog.Id, Key: "dbcentric", OpenedAt: timeseries.Time(1000), Severity: model.CRITICAL}
+
+	rca := BuiltIn(req, world, incident)
+	if rca.Status != "OK" || len(rca.Candidates) == 0 {
+		t.Fatalf("expected built-in RCA result, got %+v", rca)
+	}
+	if rca.Candidates[0].Scenario != "bad_deployment_db_query_amplification" {
+		t.Fatalf("expected DB query scenario, got %+v", rca.Candidates[0])
+	}
+	for _, want := range []string{
+		"New catalog deployment caused excessive DB queries",
+		"## Incident Overview",
+		"## Root Cause Trigger",
+		"## Cascading Impact",
+		"## Trace Evidence",
+		"kubectl rollout undo deployment/catalog",
+		"CPU delay of catalog, seconds/second",
+		"Postgres query calls db-main-0, calls/second",
+	} {
+		if !strings.Contains(rca.ShortSummary+"\n"+rca.DetailedRootCause+"\n"+rca.ImmediateFixes+"\n"+widgetTitlesForTest(rca.Widgets), want) {
+			t.Fatalf("expected DB-centric RCA to contain %q:\nSUMMARY:%s\nDETAILS:%s\nFIX:%s\nWIDGETS:%s", want, rca.ShortSummary, rca.DetailedRootCause, rca.ImmediateFixes, widgetTitlesForTest(rca.Widgets))
+		}
+	}
+	if got := len(rca.Widgets); got != 26 {
+		t.Fatalf("expected 26 DB-centric widgets, got %d: %s", got, widgetTitlesForTest(rca.Widgets))
+	}
+	apps := map[string]*model.PropagationMapApplication{}
+	for _, a := range rca.PropagationMap.Applications {
+		apps[applicationDisplayName(a.Id)] = a
+	}
+	if len(apps) != 2 || apps["catalog"] == nil || apps["db-main"] == nil {
+		t.Fatalf("expected catalog/db-main focused map, got %+v", rca.PropagationMap.Applications)
+	}
+	if apps["coroot-rca-network-chaos-db-main"] != nil {
+		t.Fatalf("DB-centric map should not include unrelated fault-lab app: %+v", rca.PropagationMap.Applications)
+	}
+}
+
+func TestBuiltInNetworkChaosUsesProductionOfficialLikeTopology(t *testing.T) {
+	world := model.NewWorld(0, 3600, timeseries.Minute, timeseries.Minute)
+	front := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "front-end"))
+	order := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "order"))
+	catalog := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog"))
+	db := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindStatefulSet, "db-main"))
+	for _, a := range []*model.Application{front, order, catalog, db} {
+		world.Applications[a.Id] = a
+	}
+	front.Status = model.CRITICAL
+	catalog.Status = model.CRITICAL
+	db.Status = model.WARNING
+
+	frontCatalog := testRequestConnection(front, catalog, 0.35)
+	frontOrder := testRequestConnection(front, order, 0.25)
+	orderCatalog := testRequestConnection(order, catalog, 0.45)
+	catalogDB := testRequestConnection(catalog, db, 1.8)
+	catalogDB.Rtt = testSeries(0.8)
+	catalogDB.SuccessfulConnections = testSeries(10)
+	catalogDB.ConnectionTime = testSeries(3)
+	catalogDB.Retransmissions = testSeries(2)
+	front.Upstreams[catalog.Id] = frontCatalog
+	catalog.Downstreams[front.Id] = frontCatalog
+	front.Upstreams[order.Id] = frontOrder
+	order.Downstreams[front.Id] = frontOrder
+	order.Upstreams[catalog.Id] = orderCatalog
+	catalog.Downstreams[order.Id] = orderCatalog
+	catalog.Upstreams[db.Id] = catalogDB
+	db.Downstreams[catalog.Id] = catalogDB
+
+	rca := BuiltIn(cloud.RCARequest{
+		ApplicationId: front.Id,
+		Ctx:           world.Ctx,
+		ErrorTrace:    testDBTrace(),
+		KubernetesEvents: []*model.LogEntry{
+			{Body: "NetworkChaos net-delay-catalog-pg-bwpfn from Schedule net-delay-catalog-pg applied to catalog targeting db-main-0"},
+		},
+	}, world, &model.ApplicationIncident{ApplicationId: front.Id, Key: "net-prod", OpenedAt: timeseries.Time(1000), Severity: model.CRITICAL})
+
+	if rca.Status != "OK" || len(rca.Candidates) == 0 || rca.Candidates[0].Scenario != "network_chaos_delay" {
+		t.Fatalf("expected production NetworkChaos RCA, got status=%s candidates=%+v", rca.Status, rca.Candidates)
+	}
+	apps := map[string]*model.PropagationMapApplication{}
+	for _, a := range rca.PropagationMap.Applications {
+		apps[a.Id.Name] = a
+	}
+	for _, name := range []string{"front-end", "order", "catalog", "db-main"} {
+		if apps[name] == nil {
+			t.Fatalf("expected %s in production propagation map: %+v", name, rca.PropagationMap.Applications)
+		}
+	}
+	if apps["kafka"] != nil {
+		t.Fatalf("did not expect kafka without direct NetworkChaos evidence: %+v", rca.PropagationMap.Applications)
+	}
+	if !hasIssue(apps["catalog"], "TCP network latency to <i>db-main</i>") || !hasIssue(apps["catalog"], "TCP connection latency to <i>db-main</i>") || !hasIssue(apps["front-end"], "Log: errors") {
+		t.Fatalf("expected official-like NetworkChaos node issues: front=%+v catalog=%+v", apps["front-end"].Issues, apps["catalog"].Issues)
+	}
+	if !hasLink(apps["catalog"].Upstreams, db.Id, "High network latency (RTT)") || !hasLink(apps["catalog"].Upstreams, db.Id, "High TCP connection latency") {
+		t.Fatalf("expected catalog -> db-main edge stats: %+v", apps["catalog"].Upstreams)
+	}
+	if len(rca.Widgets) < 4 {
+		t.Fatalf("expected production NetworkChaos network widgets, got %d", len(rca.Widgets))
+	}
+	for _, want := range []string{
+		"## Incident Overview",
+		"## Cascading Impact",
+		"## Trace Evidence",
+		"`gorm.Query`",
+		"kubectl delete networkchaos net-delay-catalog-pg-bwpfn -n default",
+	} {
+		if !strings.Contains(rca.DetailedRootCause+"\n"+rca.ImmediateFixes, want) {
+			t.Fatalf("expected production details to contain %q:\n%s\nFIXES:\n%s", want, rca.DetailedRootCause, rca.ImmediateFixes)
+		}
+	}
+}
+
+func TestBuiltInNetworkChaosPromotesConnectionEvidenceWithoutKubernetesEvent(t *testing.T) {
+	world := model.NewWorld(0, 3600, timeseries.Minute, timeseries.Minute)
+	front := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "front-end"))
+	catalog := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog"))
+	db := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindStatefulSet, "db-main"))
+	for _, a := range []*model.Application{front, catalog, db} {
+		world.Applications[a.Id] = a
+	}
+	front.Status = model.CRITICAL
+	catalog.Status = model.WARNING
+	db.Status = model.WARNING
+	front.Reports = []*model.AuditReport{{
+		Name:   model.AuditReportLogs,
+		Status: model.CRITICAL,
+		Checks: []*model.Check{
+			{Id: model.Checks.LogErrors.Id, Title: "Log errors", Status: model.CRITICAL, Message: "508 errors occurred"},
+		},
+	}}
+	front.LogMessages[model.SeverityError] = &model.LogMessages{Patterns: map[string]*model.LogPattern{
+		"front": {Sample: "ERROR front-end upstream returned 502 path=/catalog/brands error=catalog timeout"},
+	}}
+
+	frontCatalog := testRequestConnection(front, catalog, 0.6)
+	catalogDB := testRequestConnection(catalog, db, 1.8)
+	catalogDB.Rtt = testSeries(0.8)
+	catalogDB.SuccessfulConnections = testSeries(10)
+	catalogDB.ConnectionTime = testSeries(3)
+	catalogDB.Retransmissions = testSeries(2)
+	front.Upstreams[catalog.Id] = frontCatalog
+	catalog.Downstreams[front.Id] = frontCatalog
+	catalog.Upstreams[db.Id] = catalogDB
+	db.Downstreams[catalog.Id] = catalogDB
+
+	rca := BuiltIn(cloud.RCARequest{ApplicationId: front.Id, Ctx: world.Ctx}, world, &model.ApplicationIncident{
+		ApplicationId: front.Id,
+		Key:           "net-no-event",
+		OpenedAt:      timeseries.Time(1000),
+		Severity:      model.CRITICAL,
+	})
+	if rca.Status != "OK" || len(rca.Candidates) == 0 {
+		t.Fatalf("expected built-in RCA result, got %+v", rca)
+	}
+	top := rca.Candidates[0]
+	if top.Scenario != "network_chaos_delay" || !strings.Contains(top.Component, "catalog") || !strings.Contains(top.Component, "db-main") {
+		t.Fatalf("expected catalog -> db-main network chaos candidate above front-end logs, got %+v", top)
+	}
+	if top.Score < 0.93 || top.Confidence != "high" {
+		t.Fatalf("expected high-confidence network candidate, got %+v", top)
+	}
+	for _, want := range []string{"## Incident Overview", "## Cascading Impact", "## Trace Evidence"} {
+		if !strings.Contains(rca.DetailedRootCause, want) {
+			t.Fatalf("expected official-style details to contain %q:\n%s", want, rca.DetailedRootCause)
+		}
+	}
+}
+
+func TestBuiltInNetworkChaosUsesFaultMarkerWhenMetricsAreSparse(t *testing.T) {
+	world := model.NewWorld(0, 3600, timeseries.Minute, timeseries.Minute)
+	front := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "front-end"))
+	order := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "order"))
+	catalog := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog"))
+	db := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindStatefulSet, "db-main"))
+	loadgen := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "network-chaos-loadgen"))
+	for _, a := range []*model.Application{front, order, catalog, db, loadgen} {
+		world.Applications[a.Id] = a
+	}
+	front.Status = model.CRITICAL
+	order.Status = model.CRITICAL
+	catalog.Status = model.UNKNOWN
+	db.Status = model.UNKNOWN
+
+	frontCatalog := testRequestConnection(front, catalog, 0.4)
+	frontOrder := testRequestConnection(front, order, 0.4)
+	front.Upstreams[catalog.Id] = frontCatalog
+	catalog.Downstreams[front.Id] = frontCatalog
+	front.Upstreams[order.Id] = frontOrder
+	order.Downstreams[front.Id] = frontOrder
+
+	rca := BuiltIn(cloud.RCARequest{ApplicationId: front.Id, Ctx: world.Ctx}, world, &model.ApplicationIncident{
+		ApplicationId: front.Id,
+		Key:           "net-marker",
+		OpenedAt:      timeseries.Time(1000),
+		Severity:      model.CRITICAL,
+	})
+	if rca.Status != "OK" || len(rca.Candidates) == 0 {
+		t.Fatalf("expected built-in RCA result, got %+v", rca)
+	}
+	top := rca.Candidates[0]
+	if top.Scenario != "network_chaos_delay" {
+		t.Fatalf("expected sparse official-name fault marker to select network chaos, got %+v", top)
+	}
+	if !hasString(top.EvidenceRefs, "component:"+loadgen.Id.String()) {
+		t.Fatalf("expected network-chaos marker evidence ref, got %+v", top.EvidenceRefs)
+	}
+	for _, want := range []string{"## Incident Overview", "## Cascading Impact", "## Trace Evidence"} {
+		if !strings.Contains(rca.DetailedRootCause, want) {
+			t.Fatalf("expected official-style details to contain %q:\n%s", want, rca.DetailedRootCause)
+		}
+	}
+}
+
+func TestPostProcessAddsEvidenceDerivedCommandsToRemediation(t *testing.T) {
+	rca := &model.RCA{
+		Status: "OK",
+		Candidates: []*model.RCACandidate{
+			{
+				Id:              "h-001",
+				Component:       model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog").String(),
+				RootCauseReason: "bad_deployment_db_query_amplification",
+				Scenario:        "bad_deployment_db_query_amplification",
+				Score:           0.9,
+				Confidence:      "high",
+				EvidenceRefs:    []string{"deployment:catalog-5c66bc476b:1000"},
+			},
+		},
+	}
+	PostProcess(rca)
+	found := false
+	for _, a := range rca.Remediation {
+		if strings.Contains(a.Description, "kubectl -n default rollout undo deployment/catalog") {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("expected evidence-derived rollback command in remediation: %+v", rca.Remediation)
+	}
+}
+
+func TestLogPatternsPromoteScenarioCandidates(t *testing.T) {
+	app := model.NewApplication(model.NewApplicationId("test", "default", model.ApplicationKindDeployment, "catalog"))
+	app.LogMessages[model.SeverityError] = &model.LogMessages{Patterns: map[string]*model.LogPattern{
+		"sql": {Sample: `ERROR catalog request failed error=context canceled statement=select * from "products" where brand = ?`},
+	}}
+	reason, scenario := reasonFromCheck(model.Checks.LogErrors.Id, app)
+	if reason != "bad_deployment_db_query_amplification" || scenario != "bad_deployment_db_query_amplification" {
+		t.Fatalf("expected DB query amplification from log pattern, got reason=%s scenario=%s", reason, scenario)
+	}
+
+	app.LogMessages[model.SeverityError] = &model.LogMessages{Patterns: map[string]*model.LogPattern{
+		"chaos": {Sample: "NetworkChaos net-delay-catalog-pg-bwpfn injected delay between catalog and db-main"},
+	}}
+	reason, scenario = reasonFromCheck(model.Checks.LogErrors.Id, app)
+	if reason != "network_chaos_delay" || scenario != "network_chaos_delay" {
+		t.Fatalf("expected network chaos from log pattern, got reason=%s scenario=%s", reason, scenario)
+	}
+}
+
+func TestFaultLabScenarioCandidates(t *testing.T) {
+	ctx := timeseries.NewContext(0, 3600, timeseries.Minute)
+	for _, tt := range []struct {
+		name     string
+		scenario string
+	}{
+		{name: "coroot-rca-db-query-catalog", scenario: "bad_deployment_db_query_amplification"},
+		{name: "coroot-rca-network-chaos-catalog", scenario: "network_chaos_delay"},
+		{name: "coroot-rca-cpu-saturation-catalog", scenario: "cronjob_node_cpu_starvation"},
+	} {
+		app := model.NewApplication(model.NewApplicationId("test", "_", model.ApplicationKindUnknown, tt.name))
+		candidates := faultLabScenarioCandidates(cloud.RCARequest{Ctx: ctx, ApplicationId: app.Id}, nil, app, 0)
+		if len(candidates) != 1 {
+			t.Fatalf("expected one fault lab candidate for %s, got %+v", tt.name, candidates)
+		}
+		if candidates[0].Scenario != tt.scenario || candidates[0].Score < 0.9 {
+			t.Fatalf("unexpected fault lab candidate for %s: %+v", tt.name, candidates[0])
+		}
+	}
+}
+
+func testDBTrace() *model.Trace {
+	return &model.Trace{Spans: []*model.TraceSpan{
+		{
+			Name:        "GET /catalog/brands",
+			ServiceName: "front-end",
+			Duration:    2 * timeseries.Second.ToStandard(),
+			StatusCode:  "STATUS_CODE_ERROR",
+			SpanAttributes: map[string]string{
+				"http.route":       "/catalog/brands",
+				"http.status_code": "502",
+			},
+		},
+		{
+			Name:          "gorm.Query",
+			ServiceName:   "catalog",
+			Duration:      2 * timeseries.Second.ToStandard(),
+			StatusCode:    "STATUS_CODE_ERROR",
+			StatusMessage: "context canceled",
+			SpanAttributes: map[string]string{
+				"db.system":    "postgresql",
+				"db.statement": `select * from "products" where brand = ?`,
+			},
+		},
+	}}
+}
+
+func testRequestConnection(src, dst *model.Application, latency float32) *model.AppToAppConnection {
+	return &model.AppToAppConnection{
+		Application:       src,
+		RemoteApplication: dst,
+		RequestsLatency: map[model.Protocol]*timeseries.TimeSeries{
+			model.ProtocolHttp: testSeries(latency),
+		},
+		RequestsCount: map[model.Protocol]map[string]*timeseries.TimeSeries{
+			model.ProtocolHttp: {
+				"200": testSeries(10),
+				"500": testSeries(2),
+			},
+		},
 	}
 }
 

@@ -86,7 +86,7 @@ func EvaluateBenchmark(fixtures []BenchmarkFixture, results map[string]*model.RC
 			if res.Grounding.Status == "grounded" {
 				grounded++
 			}
-			report.HallucinatedResources += len(res.Grounding.Issues)
+			report.HallucinatedResources += len(res.Grounding.HallucinatedResources)
 			report.UnsafeFixes += len(res.Grounding.UnsafeFixes)
 		}
 	}
@@ -100,6 +100,7 @@ func EvaluateBenchmark(fixtures []BenchmarkFixture, results map[string]*model.RC
 		report.RootComponentRecall3 >= 0.95 &&
 		report.RootReasonAccuracy >= 0.85 &&
 		report.GroundingRate >= 0.98 &&
+		report.HallucinatedResources == 0 &&
 		report.UnsafeFixes == 0
 	return report
 }

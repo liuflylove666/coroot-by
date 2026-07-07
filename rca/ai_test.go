@@ -71,6 +71,7 @@ func TestAIPromptUsesOfficialFindingsPackage(t *testing.T) {
 
 	system, prompt := aiPrompt(rca)
 	for _, want := range []string{
+		"observability tool helping SREs troubleshoot their apps in production",
 		"Coroot has already performed the root-cause investigation",
 		"not raw telemetry",
 	} {
@@ -86,7 +87,7 @@ func TestAIPromptUsesOfficialFindingsPackage(t *testing.T) {
 		"WIDGET-1: TCP retransmissions catalog ↔ db-main, segments/second",
 		"Evidence registry",
 		"Investigation trajectory",
-		"Anomaly summary, Issue propagation paths, Key findings and Root Cause Analysis, Remediation, Relevant charts",
+		"Incident Overview, Cascading Impact, Trace Evidence, Remediation, Relevant charts",
 	} {
 		if !strings.Contains(prompt, want) {
 			t.Fatalf("expected prompt to contain %q:\n%s", want, prompt)
@@ -94,5 +95,32 @@ func TestAIPromptUsesOfficialFindingsPackage(t *testing.T) {
 	}
 	if strings.Contains(prompt, "secret") || !strings.Contains(prompt, "token=<redacted>") || !strings.Contains(prompt, "api_key=<redacted>") {
 		t.Fatalf("expected sensitive values to be redacted:\n%s", prompt)
+	}
+}
+
+func TestSanitizeAISummaryDropsUnavailableWidgetReferences(t *testing.T) {
+	out := &aiSummary{
+		ShortSummary:      "summary",
+		RootCause:         "Valid WIDGET-1 evidence and invalid WIDGET-99 evidence.",
+		DetailedRootCause: "Use WIDGET-0, WIDGET-<ID>, and WIDGET-N.",
+		ImmediateFixes:    "Verify WIDGET-3 before acting.",
+		MissingEvidence:   []string{" logs ", "logs"},
+	}
+	removed := sanitizeAISummary(out, 2)
+	if got, want := strings.Join(removed, ","), "WIDGET-99,WIDGET-<ID>,WIDGET-N,WIDGET-3"; got != want {
+		t.Fatalf("unexpected removed widget refs: got %s want %s", got, want)
+	}
+	for _, valid := range []string{"WIDGET-0", "WIDGET-1"} {
+		if !strings.Contains(out.RootCause+"\n"+out.DetailedRootCause, valid) {
+			t.Fatalf("expected valid widget ref %s to be preserved: %+v", valid, out)
+		}
+	}
+	for _, invalid := range []string{"WIDGET-99", "WIDGET-<ID>", "WIDGET-N", "WIDGET-3"} {
+		if strings.Contains(out.RootCause+"\n"+out.DetailedRootCause+"\n"+out.ImmediateFixes, invalid) {
+			t.Fatalf("expected invalid widget ref %s to be removed: %+v", invalid, out)
+		}
+	}
+	if got, want := strings.Join(out.MissingEvidence, ","), "logs"; got != want {
+		t.Fatalf("unexpected missing evidence cleanup: got %q want %q", got, want)
 	}
 }

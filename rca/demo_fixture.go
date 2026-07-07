@@ -293,14 +293,14 @@ func demoNetworkDelayWidgets(ctx timeseries.Context) []*model.Widget {
 }
 
 func demoNetworkDelayDetails() string {
-	return strings.TrimSpace("## What happened\n\n" +
+	return strings.TrimSpace("## Incident Overview\n\n" +
 		"The `front-end` service showed elevated latency (p95/p99) and a spike in failed requests. Logs and traces show `502` responses from `front-end` caused by `context canceled` when calling `http://catalog/catalog/brands`.\n\n" +
-		"## Following the dependency chain\n\n" +
+		"## Cascading Impact\n\n" +
 		"The latency of requests from `front-end` to `catalog` tracks the front-end anomaly closely.\n\n" +
 		"WIDGET-0\n\n" +
 		"Inside `catalog`, the slowdown comes from its Postgres dependency `db-main`. The query latency from `catalog` to `db-main` moves in lockstep with the anomaly, and traces show `gorm.Query` (`SELECT * FROM products WHERE brand = ?`) hanging for ~2s and failing with timeout: `context canceled`.\n\n" +
 		"WIDGET-1\n\n" +
-		"## The trigger\n\n" +
+		"## Trace Evidence\n\n" +
 		"The network path between `catalog` and `db-main` degraded sharply - both round-trip time and TCP connection time to `db-main` spiked in step with the incident:\n\n" +
 		"WIDGET-2\n\n" +
 		"WIDGET-3\n\n" +
@@ -546,6 +546,8 @@ func demoSeries(ctx timeseries.Context, base, peak, recovery float32, mode strin
 	for i := range data {
 		v := base
 		switch {
+		case mode == "flat":
+			v = base
 		case i >= start && i <= end:
 			progress := float32(i-start) / float32(maxInt(1, end-start))
 			switch mode {

@@ -76,7 +76,7 @@
             <template #item.application="{ item }">
                 <div class="d-flex">
                     <span :class="{ 'grey--text': item.resolved_at }">
-                        {{ $utils.appId(item.application_id).name }}
+                        {{ $utils.rcaAppName(item.application_id) }}
                     </span>
                 </div>
             </template>

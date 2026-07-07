@@ -33,6 +33,9 @@ type RCA struct {
 	Trajectory        []RCATrajectory        `json:"trajectory,omitempty"`
 	Grounding         *RCAGrounding          `json:"grounding,omitempty"`
 	Remediation       []RCARemediationAction `json:"remediation,omitempty"`
+	Anomalies         []RCAAnomalySignal     `json:"anomalies,omitempty"`
+	SLOForecasts      []RCASLOForecast       `json:"slo_forecasts,omitempty"`
+	Runbook           *RCARunbook            `json:"runbook,omitempty"`
 	HistoricalContext []RCAHistoricalContext `json:"historical_context,omitempty"`
 	Provider          string                 `json:"provider,omitempty"`
 	Model             string                 `json:"model,omitempty"`
@@ -43,11 +46,52 @@ type RCA struct {
 }
 
 type RCAGrounding struct {
-	Status            string   `json:"status"`
-	EvidenceCoverage  float32  `json:"evidence_coverage"`
-	HallucinationRisk string   `json:"hallucination_risk"`
-	Issues            []string `json:"issues,omitempty"`
-	UnsafeFixes       []string `json:"unsafe_fixes,omitempty"`
+	Status                string   `json:"status"`
+	EvidenceCoverage      float32  `json:"evidence_coverage"`
+	HallucinationRisk     string   `json:"hallucination_risk"`
+	Issues                []string `json:"issues,omitempty"`
+	HallucinatedResources []string `json:"hallucinated_resources,omitempty"`
+	UnsafeFixes           []string `json:"unsafe_fixes,omitempty"`
+}
+
+type RCAAnomalySignal struct {
+	Service          string   `json:"service"`
+	Component        string   `json:"component,omitempty"`
+	Metric           string   `json:"metric"`
+	Score            float32  `json:"anomaly_score"`
+	Severity         string   `json:"severity"`
+	Detector         string   `json:"detector"`
+	AnomalousMetrics []string `json:"anomalous_metrics,omitempty"`
+	EvidenceRefs     []string `json:"evidence_refs,omitempty"`
+}
+
+type RCASLOForecast struct {
+	Service                string   `json:"service"`
+	SLI                    string   `json:"sli"`
+	BreachProbability      float32  `json:"breach_probability"`
+	TimeToBreachMinutes    int      `json:"time_to_breach_minutes,omitempty"`
+	ForecastValueAtHorizon float32  `json:"forecast_value_at_horizon,omitempty"`
+	Target                 float32  `json:"target"`
+	Direction              string   `json:"direction"`
+	IsAtRisk               bool     `json:"is_at_risk"`
+	EvidenceRefs           []string `json:"evidence_refs,omitempty"`
+}
+
+type RCARunbook struct {
+	Title             string   `json:"title"`
+	Severity          string   `json:"severity"`
+	Summary           string   `json:"summary"`
+	ImpactAssessment  string   `json:"impact_assessment"`
+	DetectionTimeline string   `json:"detection_timeline"`
+	DiagnosisSteps    string   `json:"diagnosis_steps"`
+	RemediationSteps  string   `json:"remediation_steps"`
+	EscalationPath    string   `json:"escalation_path"`
+	FollowUpActions   string   `json:"follow_up_actions"`
+	SectionsComplete  bool     `json:"sections_complete"`
+	MissingSections   []string `json:"missing_sections,omitempty"`
+	AffectedServices  []string `json:"affected_services,omitempty"`
+	EvidenceRefs      []string `json:"evidence_refs,omitempty"`
+	GeneratedBy       string   `json:"generated_by,omitempty"`
 }
 
 type RCARemediationAction struct {

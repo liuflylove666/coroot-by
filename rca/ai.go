@@ -4,12 +4,18 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
 	aiintegration "github.com/coroot/coroot/ai"
 	"github.com/coroot/coroot/model"
 )
+
+const aiRCAMaxTokens = 8000
+
+var aiWidgetRefRe = regexp.MustCompile(`WIDGET-(?:<ID>|N|[0-9]+)`)
 
 type aiSummary struct {
 	ShortSummary      string   `json:"short_summary"`
@@ -33,7 +39,8 @@ func EnhanceWithAI(ctx context.Context, builtIn *model.RCA, settings aiintegrati
 	resp, err := provider.Complete(ctx, aiintegration.CompletionRequest{
 		System:    system,
 		Prompt:    prompt,
-		MaxTokens: 2200,
+		MaxTokens: aiRCAMaxTokens,
+		Tool:      recordSummaryTool(),
 	})
 	builtIn.Provider = provider.Name()
 	builtIn.Model = provider.Model()
@@ -53,7 +60,11 @@ func EnhanceWithAI(ctx context.Context, builtIn *model.RCA, settings aiintegrati
 		builtIn.ValidatorResult = "invalid_model_output"
 		return builtIn, err
 	}
-	sanitizeAISummary(&out)
+	removedWidgets := sanitizeAISummary(&out, len(builtIn.Widgets))
+	if len(removedWidgets) > 0 {
+		out.MissingEvidence = append(out.MissingEvidence, fmt.Sprintf("AI output referenced unavailable widgets: %s", strings.Join(removedWidgets, ", ")))
+		out.MissingEvidence = sanitizeMissingEvidence(out.MissingEvidence)
+	}
 	builtIn.ShortSummary = out.ShortSummary
 	builtIn.RootCause = out.RootCause
 	builtIn.DetailedRootCause = out.DetailedRootCause
@@ -69,14 +80,17 @@ func EnhanceWithAI(ctx context.Context, builtIn *model.RCA, settings aiintegrati
 }
 
 func aiPrompt(rca *model.RCA) (string, string) {
-	system := `You are Coroot's AI RCA renderer.
-Coroot has already performed the root-cause investigation using dependency graph analysis, ML scoring, checks, traces, logs, events, and charts.
+	system := `You're Coroot, an observability tool helping SREs troubleshoot their apps in production.
+Coroot has already performed the root-cause investigation using dependency graph analysis, ML scoring, checks, traces, logs, Kubernetes events, profiles, and charts.
+Coroot traverses the dependency graph and checks correlation between metrics. Strong correlations can guide the explanation, but do not mention Pearson coefficients.
+Profile reports are always diff profiles comparing anomaly and baseline windows. Ignore profiles whose top-changed functions are unknown, shared libraries, libc/runtime symbols, or low-level process startup frames.
 You receive only Coroot findings, not raw telemetry. Your task is explanation and summarization only.
-Do not invent services, namespaces, deployments, nodes, widgets, commands, or root causes. Return strict JSON only.`
+Do not invent services, namespaces, deployments, nodes, widgets, commands, or root causes. Return data only through the record_summary schema or strict JSON with the same fields.`
 	var b strings.Builder
-	b.WriteString("Render the following built-in RCA findings as a concise official-style incident RCA.\n")
-	b.WriteString("This package is the compact Coroot findings set; do not request or assume raw telemetry outside it.\n\n")
-	b.WriteString("Required JSON fields: short_summary, root_cause, detailed_root_cause_analysis, immediate_fixes, confidence, missing_evidence.\n\n")
+	b.WriteString("Render the following Coroot RCA findings as a concise official-style incident RCA.\n")
+	b.WriteString("This package is the compact Coroot findings set; do not request or assume raw telemetry outside it.\n")
+	b.WriteString("Use the same evidence-first structure as Coroot Enterprise RCA: Incident Overview, Cascading Impact, Trace Evidence, and Remediation.\n\n")
+	b.WriteString("Required record_summary fields: short_summary, root_cause, detailed_root_cause_analysis, immediate_fixes. Optional fields: confidence, missing_evidence.\n\n")
 	b.WriteString("Built-in anomaly summary:\n")
 	b.WriteString(promptSafeText(rca.ShortSummary) + "\n\n")
 	if strings.TrimSpace(rca.RootCause) != "" {
@@ -116,12 +130,53 @@ Do not invent services, namespaces, deployments, nodes, widgets, commands, or ro
 	b.WriteString("\nConstraints:\n")
 	b.WriteString("- short_summary: one sentence, 80-180 chars when possible.\n")
 	b.WriteString("- root_cause: direct conclusion grounded in the top candidate.\n")
-	b.WriteString("- detailed_root_cause_analysis: Markdown with these sections in order: Anomaly summary, Issue propagation paths, Key findings and Root Cause Analysis, Remediation, Relevant charts.\n")
+	b.WriteString("- detailed_root_cause_analysis: Markdown with these sections in order: Incident Overview, Cascading Impact, Trace Evidence, Remediation, Relevant charts.\n")
 	b.WriteString("- Issue propagation paths must come from the propagation map or candidate graph_paths only.\n")
 	b.WriteString("- Relevant charts must reference available widget ids as WIDGET-N and must not invent chart names.\n")
 	b.WriteString("- immediate_fixes: separate mitigation from permanent fix; include commands only when exact resources are present in evidence.\n")
 	b.WriteString("- If evidence is missing or weak, say what is missing instead of overstating certainty.\n")
 	return system, b.String()
+}
+
+func recordSummaryTool() *aiintegration.CompletionTool {
+	return &aiintegration.CompletionTool{
+		Name:        "record_summary",
+		Description: "Record summary of an incident in well-structured JSON",
+		Parameters: map[string]any{
+			"type":                 "object",
+			"additionalProperties": false,
+			"properties": map[string]any{
+				"short_summary": map[string]any{
+					"type":        "string",
+					"description": "One concise sentence summarizing the incident and most likely root cause.",
+				},
+				"root_cause": map[string]any{
+					"type":        "string",
+					"description": "Direct root-cause conclusion grounded only in provided Coroot evidence.",
+				},
+				"detailed_root_cause_analysis": map[string]any{
+					"type":        "string",
+					"description": "Markdown RCA details with propagation, evidence, remediation, and relevant charts.",
+				},
+				"immediate_fixes": map[string]any{
+					"type":        "string",
+					"description": "Immediate mitigation and permanent fix guidance; include commands only when exact resources are present.",
+				},
+				"confidence": map[string]any{
+					"type":        "string",
+					"description": "Evidence-grounded confidence label such as high, medium, or low.",
+				},
+				"missing_evidence": map[string]any{
+					"type": "array",
+					"items": map[string]any{
+						"type": "string",
+					},
+					"description": "Evidence that would be needed to increase confidence.",
+				},
+			},
+			"required": []string{"short_summary", "root_cause", "immediate_fixes", "detailed_root_cause_analysis"},
+		},
+	}
 }
 
 func appendPropagationMapPrompt(b *strings.Builder, pm *model.PropagationMap) {
@@ -219,14 +274,59 @@ func validateAISummary(out aiSummary) error {
 	return nil
 }
 
-func sanitizeAISummary(out *aiSummary) {
+func sanitizeAISummary(out *aiSummary, widgetCount int) []string {
 	out.ShortSummary = truncateRunes(sanitizeText(out.ShortSummary), 240)
 	out.RootCause = truncateRunes(sanitizeText(out.RootCause), 1400)
 	out.DetailedRootCause = truncateRunes(sanitizeText(out.DetailedRootCause), 6000)
 	out.ImmediateFixes = truncateRunes(sanitizeText(out.ImmediateFixes), 1200)
-	for i := range out.MissingEvidence {
-		out.MissingEvidence[i] = truncateRunes(sanitizeText(out.MissingEvidence[i]), 160)
+	var removed []string
+	out.RootCause, removed = sanitizeWidgetReferences(out.RootCause, widgetCount, removed)
+	out.DetailedRootCause, removed = sanitizeWidgetReferences(out.DetailedRootCause, widgetCount, removed)
+	out.ImmediateFixes, removed = sanitizeWidgetReferences(out.ImmediateFixes, widgetCount, removed)
+	out.MissingEvidence = sanitizeMissingEvidence(out.MissingEvidence)
+	return removed
+}
+
+func sanitizeMissingEvidence(items []string) []string {
+	if len(items) == 0 {
+		return nil
 	}
+	res := make([]string, 0, len(items))
+	seen := map[string]bool{}
+	for _, item := range items {
+		clean := truncateRunes(sanitizeText(item), 180)
+		if clean == "" || seen[clean] {
+			continue
+		}
+		seen[clean] = true
+		res = append(res, clean)
+	}
+	return res
+}
+
+func sanitizeWidgetReferences(s string, widgetCount int, removed []string) (string, []string) {
+	if s == "" {
+		return s, removed
+	}
+	seen := map[string]bool{}
+	for _, r := range removed {
+		seen[r] = true
+	}
+	clean := aiWidgetRefRe.ReplaceAllStringFunc(s, func(ref string) string {
+		raw := strings.TrimPrefix(ref, "WIDGET-")
+		if n, err := strconv.Atoi(raw); err == nil && n >= 0 && n < widgetCount {
+			return ref
+		}
+		if !seen[ref] {
+			removed = append(removed, ref)
+			seen[ref] = true
+		}
+		if widgetCount > 0 {
+			return "available evidence charts"
+		}
+		return "available evidence"
+	})
+	return clean, removed
 }
 
 func truncateRunes(s string, max int) string {

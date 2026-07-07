@@ -36,6 +36,11 @@ export default class Utils {
         };
     }
 
+    rcaAppName(id) {
+        const name = this.appId(id).name || id;
+        return name.replace(/^(coroot-rca-)?(db-query|network-chaos|cpu-saturation)-/, '');
+    }
+
     nodeId(id) {
         const parts = id.split(':');
         return {
